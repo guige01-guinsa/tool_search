@@ -162,10 +162,12 @@ def layout(
 ) -> str:
     nav = nav_for_user(user)
     chip = user_chip(user)
-    auth_actions = ""
+    install_button = "<button class='btn secondary' id='install-app-btn' type='button' hidden>앱 설치</button>"
+    auth_actions = install_button
     if user:
         auth_actions = (
-            "<form action='/logout' method='post'>"
+            install_button
+            + "<form action='/logout' method='post'>"
             "<button class='btn secondary' type='submit'>로그아웃</button>"
             "</form>"
         )
@@ -175,6 +177,15 @@ def layout(
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="theme-color" content="#1f5a55"/>
+  <meta name="mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="default"/>
+  <meta name="apple-mobile-web-app-title" content="시설운영"/>
+  <meta name="application-name" content="시설운영"/>
+  <link rel="manifest" href="/manifest.webmanifest"/>
+  <link rel="icon" href="/assets/pwa/icon-192.png" sizes="192x192" type="image/png"/>
+  <link rel="apple-touch-icon" href="/assets/pwa/apple-touch-icon.png"/>
   <title>{esc(title)}</title>
   <style>
     :root {{
@@ -293,6 +304,13 @@ def layout(
     .flash.warn {{ border-color: rgba(168, 97, 21, 0.22); color: var(--warn); }}
     .flash.error {{ border-color: rgba(160, 54, 47, 0.22); color: var(--danger); }}
     .flash.info {{ border-color: rgba(31, 90, 85, 0.2); color: var(--brand); }}
+    .flash.install-tip {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }}
     .metrics {{
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -500,6 +518,7 @@ def layout(
       .top-actions form, .top-actions a {{ flex: 1 1 auto; }}
       .top-actions .btn {{ width: 100%; }}
       .nav-link {{ flex: 1 1 auto; text-align: center; }}
+      .flash.install-tip {{ align-items: flex-start; }}
     }}
   </style>
 </head>
@@ -520,7 +539,72 @@ def layout(
     </div>
     {nav}
     {flash_block(flash_message, flash_level)}
+    <div class="flash install-tip" id="ios-install-tip" hidden>
+      <div>
+        <strong>홈 화면에 추가</strong>
+        <div class="muted">iPhone/iPad Safari에서는 공유 버튼을 누른 뒤 "홈 화면에 추가"를 선택하세요.</div>
+      </div>
+      <button class="btn secondary" id="ios-install-dismiss" type="button">닫기</button>
+    </div>
     {body}
   </div>
+  <script>
+    (() => {{
+      let deferredInstallPrompt = null;
+      const installButton = document.getElementById("install-app-btn");
+      const iosTip = document.getElementById("ios-install-tip");
+      const iosDismiss = document.getElementById("ios-install-dismiss");
+      const isIos = /iphone|ipad|ipod/i.test(window.navigator.userAgent);
+      const isStandalone = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
+
+      if ("serviceWorker" in navigator) {{
+        window.addEventListener("load", () => {{
+          navigator.serviceWorker.register("/sw.js").catch((error) => console.warn("sw register failed", error));
+        }});
+      }}
+
+      window.addEventListener("beforeinstallprompt", (event) => {{
+        event.preventDefault();
+        deferredInstallPrompt = event;
+        if (installButton) {{
+          installButton.hidden = false;
+        }}
+      }});
+
+      window.addEventListener("appinstalled", () => {{
+        deferredInstallPrompt = null;
+        if (installButton) {{
+          installButton.hidden = true;
+        }}
+      }});
+
+      if (installButton) {{
+        installButton.addEventListener("click", async () => {{
+          if (!deferredInstallPrompt) {{
+            if (isIos && !isStandalone && iosTip) {{
+              iosTip.hidden = false;
+            }}
+            return;
+          }}
+          deferredInstallPrompt.prompt();
+          await deferredInstallPrompt.userChoice;
+          deferredInstallPrompt = null;
+          installButton.hidden = true;
+        }});
+      }}
+
+      if (iosDismiss) {{
+        iosDismiss.addEventListener("click", () => {{
+          if (iosTip) {{
+            iosTip.hidden = true;
+          }}
+        }});
+      }}
+
+      if (isIos && !isStandalone && iosTip) {{
+        iosTip.hidden = false;
+      }}
+    }})();
+  </script>
 </body>
 </html>"""

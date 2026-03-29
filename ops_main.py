@@ -8,7 +8,7 @@ from typing import Iterable, List
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from ops import auth
@@ -28,11 +28,15 @@ from ops.ui import (
 )
 
 BASE_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = BASE_DIR / "assets"
+ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR = Path(os.getenv("OPS_UPLOAD_DIR", str(BASE_DIR / "uploads")))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 COOKIE_SECURE = str(os.getenv("OPS_COOKIE_SECURE", "")).strip().lower() in {"1", "true", "on", "yes"}
+PWA_CACHE_VERSION = "facility-ops-v1"
 
 app = FastAPI(title="시설 운영 시스템")
+app.mount("/assets", StaticFiles(directory=str(ASSETS_DIR)), name="assets")
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 
@@ -84,6 +88,133 @@ def _with_flash(path: str, message: str = "", level: str = "info") -> RedirectRe
 
 def _flash_from_request(request: Request) -> tuple[str, str]:
     return request.query_params.get("msg", ""), request.query_params.get("level", "info")
+
+
+@app.get("/manifest.webmanifest")
+def pwa_manifest():
+    return JSONResponse(
+        {
+            "id": "/",
+            "name": "시설 운영 시스템",
+            "short_name": "시설운영",
+            "description": "시설, 재고, 작업지시, 보고서를 한 화면에서 관리합니다.",
+            "lang": "ko",
+            "start_url": "/login?source=pwa",
+            "scope": "/",
+            "display": "standalone",
+            "orientation": "portrait",
+            "background_color": "#f2f4ef",
+            "theme_color": "#1f5a55",
+            "icons": [
+                {
+                    "src": "/assets/pwa/icon-192.png",
+                    "sizes": "192x192",
+                    "type": "image/png",
+                    "purpose": "any maskable",
+                },
+                {
+                    "src": "/assets/pwa/icon-512.png",
+                    "sizes": "512x512",
+                    "type": "image/png",
+                    "purpose": "any maskable",
+                },
+                {
+                    "src": "/assets/pwa/apple-touch-icon.png",
+                    "sizes": "180x180",
+                    "type": "image/png",
+                    "purpose": "any",
+                },
+            ],
+        },
+        media_type="application/manifest+json",
+    )
+
+
+@app.get("/sw.js")
+def pwa_service_worker():
+    script = f"""
+const CACHE_NAME = "{PWA_CACHE_VERSION}";
+const APP_SHELL = [
+  "/login",
+  "/manifest.webmanifest",
+  "/assets/pwa/icon-192.png",
+  "/assets/pwa/icon-512.png",
+  "/assets/pwa/apple-touch-icon.png"
+];
+
+self.addEventListener("install", (event) => {{
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)).then(() => self.skipWaiting())
+  );
+}});
+
+self.addEventListener("activate", (event) => {{
+  event.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(
+        keys.map((key) => {{
+          if (key !== CACHE_NAME) {{
+            return caches.delete(key);
+          }}
+          return Promise.resolve();
+        }})
+      )
+    ).then(() => self.clients.claim())
+  );
+}});
+
+self.addEventListener("fetch", (event) => {{
+  const request = event.request;
+  if (request.method !== "GET") {{
+    return;
+  }}
+
+  const url = new URL(request.url);
+  if (url.origin !== self.location.origin) {{
+    return;
+  }}
+
+  if (request.mode === "navigate") {{
+    event.respondWith(
+      fetch(request)
+        .then((response) => {{
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
+          return response;
+        }})
+        .catch(async () => (await caches.match(request)) || (await caches.match("/login")))
+    );
+    return;
+  }}
+
+  if (url.pathname.startsWith("/assets/") || url.pathname === "/manifest.webmanifest") {{
+    event.respondWith(
+      caches.match(request).then((cached) => {{
+        if (cached) {{
+          return cached;
+        }}
+        return fetch(request).then((response) => {{
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
+          return response;
+        }});
+      }})
+    );
+    return;
+  }}
+
+  event.respondWith(
+    fetch(request)
+      .then((response) => {{
+        const copy = response.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
+        return response;
+      }})
+      .catch(() => caches.match(request))
+  );
+}});
+""".strip()
+    return Response(content=script, media_type="application/javascript")
 
 
 def _admin_bootstrap_message() -> str:
