@@ -184,7 +184,7 @@ def _guest_page(
 
 def _register_panel() -> str:
     return (
-        "<section class='panel'><h2>회원가입</h2><p class='muted'>신규 계정은 기본적으로 비활성 상태로 생성되며, 관리자 승인 후 사용할 수 있습니다.</p>"
+        "<section class='panel'><h2>회원가입</h2><p class='muted'>신규 계정은 기본적으로 조회전용으로 즉시 생성되며, 가입 직후 바로 로그인할 수 있습니다.</p>"
         "<form action='/register' method='post' class='stack' style='margin-top:16px;'>"
         "<div><label>아이디</label><input name='username' autocomplete='username' required></div>"
         "<div><label>이름</label><input name='full_name' required></div>"
@@ -193,7 +193,7 @@ def _register_panel() -> str:
         "<div><label>비밀번호 확인</label><input name='password_confirm' type='password' autocomplete='new-password' required></div>"
         "<div><label>복구 질문</label><input name='recovery_question' placeholder='예: 가장 기억에 남는 근무지는?' required></div>"
         "<div><label>복구 답변</label><input name='recovery_answer' type='password' autocomplete='off' required></div>"
-        "<div class='row-actions'><button class='btn primary' type='submit'>회원가입 요청</button></div>"
+        "<div class='row-actions'><button class='btn primary' type='submit'>회원가입</button></div>"
         "</form></section>"
     )
 
@@ -325,6 +325,14 @@ def _compose_facility_location(row) -> str:
     return " / ".join(parts) if parts else "-"
 
 
+def _post_action_button(path: str, label: str, confirm_message: str | None = None, tone: str = "danger") -> str:
+    confirm_attr = f" onclick=\"return confirm('{esc(confirm_message)}');\"" if confirm_message else ""
+    return (
+        f"<button class='btn {tone}' type='submit' formaction='{esc(path)}' formmethod='post' formnovalidate"
+        f"{confirm_attr}>{esc(label)}</button>"
+    )
+
+
 def _facility_options(conn) -> list[tuple[str, str]]:
     rows = conn.execute(
         "SELECT id, facility_code, name FROM facilities ORDER BY name ASC, id ASC"
@@ -355,6 +363,11 @@ DB_TABLE_LABELS = {
 }
 DB_MANAGED_TABLES = list(DB_TABLE_LABELS.keys())
 DB_TEXTAREA_COLUMNS = {"note", "body", "description", "reason", "specification"}
+DB_CODE_FIELDS = {
+    "facilities": ("facility_code", "FAC"),
+    "inventory_items": ("item_code", "INV"),
+    "work_orders": ("work_code", "WO"),
+}
 _DB_OMIT = object()
 
 
@@ -407,6 +420,8 @@ def _db_form_field(column, value) -> str:
     default_note = ""
     if column["dflt_value"] is not None:
         default_note = f"<div class='muted'>빈값이면 기본값: {esc(_db_default_text(column['dflt_value']))}</div>"
+    elif any(name == code_field for code_field, _ in DB_CODE_FIELDS.values()):
+        default_note = "<div class='muted'>빈값이면 저장 시 자동 채번됩니다.</div>"
 
     label = f"{esc(name)} <span class='muted'>{esc(column['type'] or 'TEXT')}</span>"
     value_text = "" if value is None else str(value)
@@ -574,7 +589,7 @@ def login_page(request: Request):
         """
         + "</section>"
         + "<div class='stack'>"
-        + info_box("계정 지원", "신규 사용자는 회원가입 후 관리자 승인으로 활성화할 수 있고, 아이디 찾기와 비밀번호 재설정은 등록된 연락처와 복구질문을 기준으로 처리됩니다.")
+        + info_box("계정 지원", "신규 사용자는 회원가입 직후 바로 로그인할 수 있고, 아이디 찾기와 비밀번호 재설정은 등록된 연락처와 복구질문을 기준으로 처리됩니다.")
         + info_box("권한 모델", "관리자, 운영관리, 작업자, 조회전용 역할에 따라 화면 접근과 수정 범위가 나뉩니다.")
         + info_box("공유 운영", "시설 상태, 재고 변동, 작업 진행 내역은 사용자 계정 기준으로 남아 이후 감사와 보고서 자동화에 활용됩니다.")
         + "</div></div>"
@@ -624,12 +639,12 @@ def register_page(request: Request):
     return _guest_page(
         title="회원가입",
         eyebrow="Account Onboarding",
-        heading="회원가입 요청",
-        description="현장 팀원 계정은 승인형으로 생성해 무분별한 권한 부여를 막습니다.",
+        heading="회원가입",
+        description="현장 팀원 계정은 조회전용으로 즉시 생성하고, 필요 시 관리자가 역할을 상향합니다.",
         active_tab="register",
         main_panel=_register_panel(),
         side_content=(
-            info_box("승인 방식", "회원가입으로 생성된 계정은 기본적으로 조회전용·비활성 상태입니다. 관리자가 확인 후 활성화와 역할을 지정합니다.")
+            info_box("기본 권한", "회원가입 계정은 기본적으로 조회전용으로 활성화됩니다. 추가 권한이 필요하면 관리자가 역할을 조정합니다.")
             + info_box("복구 정보", "아이디 찾기와 비밀번호 재설정은 가입 시 등록한 연락처와 복구 질문/답변을 기준으로 처리됩니다.")
         ),
         flash_message=flash_message,
@@ -689,7 +704,7 @@ def register_submit(
                 username, full_name, role, password_hash, is_active, phone,
                 recovery_question, recovery_answer_hash, created_at, updated_at
             )
-            VALUES (?, ?, 'viewer', ?, 0, ?, ?, ?, ?, ?)
+            VALUES (?, ?, 'viewer', ?, 1, ?, ?, ?, ?, ?)
             """,
             (
                 username_v,
@@ -704,7 +719,7 @@ def register_submit(
         )
         conn.commit()
         conn.close()
-        return _with_flash("/login", "회원가입 요청이 접수되었습니다. 관리자 승인 후 로그인할 수 있습니다.", "ok")
+        return _with_flash("/login", "회원가입이 완료되었습니다. 바로 로그인할 수 있습니다.", "ok")
     except Exception as exc:
         conn.close()
         return _with_flash("/register", f"회원가입 요청에 실패했습니다: {exc}", "error")
@@ -770,7 +785,7 @@ def account_username_submit(
             flash_level="error",
         )
 
-    status_text = "활성" if user["is_active"] else "승인 대기"
+    status_text = "활성" if user["is_active"] else "비활성"
     result_html = (
         "<section class='panel' style='margin-top:16px;'>"
         "<h2>조회 결과</h2>"
@@ -786,7 +801,7 @@ def account_username_submit(
         active_tab="username",
         main_panel=_username_recovery_panel(result_html),
         side_content=(
-            info_box("다음 단계", "승인 대기 계정은 관리자가 활성화해야 로그인할 수 있습니다.")
+            info_box("다음 단계", "비활성 계정은 관리자가 다시 활성화해야 로그인할 수 있습니다.")
             + info_box("비밀번호가 기억나지 않으면", "비밀번호 재설정 화면에서 같은 복구 정보와 새 비밀번호를 입력하면 바로 변경할 수 있습니다.")
         ),
         flash_message="아이디를 확인했습니다.",
@@ -1093,7 +1108,7 @@ def facilities_page(request: Request):
             + "<button class='btn primary' type='submit'>저장</button>"
             + "<a class='btn secondary' href='/facilities'>새로 입력</a>"
             + (
-                f"<form action='/facilities/delete/{edit_row['id']}' method='post' onsubmit=\"return confirm('시설을 삭제하시겠습니까?');\"><button class='btn danger' type='submit'>삭제</button></form>"
+                _post_action_button(f"/facilities/delete/{edit_row['id']}", "삭제", "시설을 삭제하시겠습니까?")
                 if edit_row
                 else ""
             )
@@ -1347,7 +1362,7 @@ def inventory_page(request: Request):
             + "<button class='btn primary' type='submit'>저장</button>"
             + "<a class='btn secondary' href='/inventory'>새로 입력</a>"
             + (
-                f"<form action='/inventory/delete/{edit_row['id']}' method='post' onsubmit=\"return confirm('재고 품목을 삭제하시겠습니까?');\"><button class='btn danger' type='submit'>삭제</button></form>"
+                _post_action_button(f"/inventory/delete/{edit_row['id']}", "삭제", "재고 품목을 삭제하시겠습니까?")
                 if edit_row and can_edit
                 else ""
             )
@@ -1744,7 +1759,7 @@ def work_orders_page(request: Request):
                 + "<button class='btn primary' type='submit'>저장</button>"
                 + "<a class='btn secondary' href='/work-orders'>새로 입력</a>"
                 + (
-                    f"<form action='/work-orders/delete/{edit_row['id']}' method='post' onsubmit=\"return confirm('작업지시를 삭제하시겠습니까?');\"><button class='btn danger' type='submit'>삭제</button></form>"
+                    _post_action_button(f"/work-orders/delete/{edit_row['id']}", "삭제", "작업지시를 삭제하시겠습니까?")
                     if edit_row and can_delete_edit_row
                     else ""
                 )
@@ -2360,7 +2375,12 @@ async def database_save(request: Request):
         for column in columns:
             if column["pk"]:
                 continue
-            converted = _db_convert_value(column, form.get(f"col_{column['name']}", ""), for_create=True)
+            raw_value = form.get(f"col_{column['name']}", "")
+            code_info = DB_CODE_FIELDS.get(table)
+            if code_info and column["name"] == code_info[0] and str(raw_value or "").strip() == "":
+                converted = f"__pending__{code_info[1].lower()}_{uuid.uuid4().hex}"
+            else:
+                converted = _db_convert_value(column, raw_value, for_create=True)
             if converted is _DB_OMIT:
                 continue
             insert_columns.append(column["name"])
@@ -2373,6 +2393,19 @@ async def database_save(request: Request):
         )
         conn.commit()
         new_id = cursor.lastrowid
+        code_info = DB_CODE_FIELDS.get(table)
+        if code_info:
+            code_field, code_prefix = code_info
+            current_code = conn.execute(
+                f"SELECT {code_field} FROM {table} WHERE id = ?",
+                (new_id,),
+            ).fetchone()[code_field]
+            if str(current_code).startswith("__pending__"):
+                conn.execute(
+                    f"UPDATE {table} SET {code_field} = ? WHERE id = ?",
+                    (f"{code_prefix}-{new_id:04d}", new_id),
+                )
+                conn.commit()
         conn.close()
         return _with_flash(f"/admin/database?table={table}&edit={new_id}", "행이 등록되었습니다.", "ok")
     except Exception as exc:
@@ -2454,7 +2487,13 @@ def users_page(request: Request):
             if edit_row
             else "<label style='display:flex;align-items:center;gap:8px;'><input name='is_active' type='checkbox' value='1' checked style='width:auto;'>활성 사용자</label>"
         )
-        + "<div class='row-actions'><button class='btn primary' type='submit'>저장</button><a class='btn secondary' href='/admin/users'>새로 입력</a></div>"
+        + "<div class='row-actions'><button class='btn primary' type='submit'>저장</button><a class='btn secondary' href='/admin/users'>새로 입력</a>"
+        + (
+            _post_action_button(f"/admin/users/delete/{edit_row['id']}", "삭제", "사용자를 삭제하시겠습니까?")
+            if edit_row
+            else ""
+        )
+        + "</div>"
         + "</form></section>"
     )
 
@@ -2655,6 +2694,33 @@ def users_save(
     except Exception as exc:
         conn.close()
         return _with_flash("/admin/users", f"사용자 저장에 실패했습니다: {exc}", "error")
+
+
+@app.post("/admin/users/delete/{user_id}")
+def users_delete(request: Request, user_id: int):
+    current_user, error = _authorize(request, "users:manage")
+    if error:
+        return error
+
+    if user_id == current_user["id"]:
+        return _with_flash(f"/admin/users?edit={user_id}", "현재 로그인한 계정은 삭제할 수 없습니다.", "error")
+
+    conn = get_conn()
+    target = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not target:
+        conn.close()
+        return _with_flash("/admin/users", "사용자를 찾을 수 없습니다.", "error")
+
+    try:
+        auth.invalidate_user_sessions(user_id)
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+        return _with_flash("/admin/users", "사용자가 삭제되었습니다.", "ok")
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return _with_flash(f"/admin/users?edit={user_id}", f"사용자 삭제에 실패했습니다: {exc}", "error")
 
 
 @app.get("/healthz")
