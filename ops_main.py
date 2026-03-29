@@ -98,6 +98,139 @@ def _admin_bootstrap_message() -> str:
     )
 
 
+def _auth_entry_links(active: str) -> str:
+    links = [
+        ("/login", "로그인", "login"),
+        ("/register", "회원가입", "register"),
+        ("/account/username", "아이디 찾기", "username"),
+        ("/account/password", "비밀번호 재설정", "password"),
+    ]
+    items = []
+    for href, label, key in links:
+        tone = "primary" if key == active else "secondary"
+        items.append(f"<a class='btn {tone}' href='{href}'>{esc(label)}</a>")
+    return "<div class='row-actions' style='margin:16px 0; flex-wrap:wrap;'>" + "".join(items) + "</div>"
+
+
+def _redirect_if_logged_in(request: Request):
+    user = auth.get_user_by_session(request.cookies.get(auth.SESSION_COOKIE))
+    if user:
+        return RedirectResponse(url="/", status_code=303)
+    return None
+
+
+def _normalize_recovery_question(question: str) -> str:
+    return str(question or "").strip()
+
+
+def _password_error(password: str) -> str:
+    if len(password.strip()) < 8:
+        return "비밀번호는 8자 이상으로 입력해 주세요."
+    return ""
+
+
+def _mask_username(username: str) -> str:
+    value = username.strip()
+    if len(value) <= 2:
+        return value[:1] + "*"
+    return value[:2] + ("*" * (len(value) - 3)) + value[-1]
+
+
+def _find_recovery_user(
+    conn,
+    *,
+    full_name: str,
+    phone: str,
+    recovery_question: str,
+    username: str | None = None,
+):
+    params = [full_name.strip(), auth.normalize_phone(phone), _normalize_recovery_question(recovery_question)]
+    sql = """
+        SELECT *
+        FROM users
+        WHERE full_name = ?
+          AND phone = ?
+          AND recovery_question = ?
+    """
+    if username is not None:
+        sql += " AND username = ?"
+        params.append(username.strip())
+    return conn.execute(sql, params).fetchone()
+
+
+def _guest_page(
+    *,
+    title: str,
+    eyebrow: str,
+    heading: str,
+    description: str,
+    active_tab: str,
+    main_panel: str,
+    side_content: str,
+    flash_message: str = "",
+    flash_level: str = "info",
+):
+    body = (
+        page_header(eyebrow, heading, description)
+        + _auth_entry_links(active_tab)
+        + "<div class='layout-2'>"
+        + main_panel
+        + "<div class='stack'>"
+        + side_content
+        + "</div></div>"
+    )
+    return HTMLResponse(layout(title=title, body=body, flash_message=flash_message, flash_level=flash_level))
+
+
+def _register_panel() -> str:
+    return (
+        "<section class='panel'><h2>회원가입</h2><p class='muted'>신규 계정은 기본적으로 비활성 상태로 생성되며, 관리자 승인 후 사용할 수 있습니다.</p>"
+        "<form action='/register' method='post' class='stack' style='margin-top:16px;'>"
+        "<div><label>아이디</label><input name='username' autocomplete='username' required></div>"
+        "<div><label>이름</label><input name='full_name' required></div>"
+        "<div><label>연락처</label><input name='phone' inputmode='tel' placeholder='숫자만 또는 010-0000-0000' required></div>"
+        "<div><label>비밀번호</label><input name='password' type='password' autocomplete='new-password' required></div>"
+        "<div><label>비밀번호 확인</label><input name='password_confirm' type='password' autocomplete='new-password' required></div>"
+        "<div><label>복구 질문</label><input name='recovery_question' placeholder='예: 가장 기억에 남는 근무지는?' required></div>"
+        "<div><label>복구 답변</label><input name='recovery_answer' type='password' autocomplete='off' required></div>"
+        "<div class='row-actions'><button class='btn primary' type='submit'>회원가입 요청</button></div>"
+        "</form></section>"
+    )
+
+
+def _username_recovery_panel(result_html: str = "") -> str:
+    return (
+        "<section class='panel'><h2>아이디 찾기</h2><p class='muted'>이름, 연락처, 복구 질문과 답변이 일치하면 아이디를 확인할 수 있습니다.</p>"
+        "<form action='/account/username' method='post' class='stack' style='margin-top:16px;'>"
+        "<div><label>이름</label><input name='full_name' required></div>"
+        "<div><label>연락처</label><input name='phone' inputmode='tel' required></div>"
+        "<div><label>복구 질문</label><input name='recovery_question' required></div>"
+        "<div><label>복구 답변</label><input name='recovery_answer' type='password' autocomplete='off' required></div>"
+        "<div class='row-actions'><button class='btn primary' type='submit'>아이디 확인</button></div>"
+        "</form>"
+        + result_html
+        + "</section>"
+    )
+
+
+def _password_reset_panel(result_html: str = "") -> str:
+    return (
+        "<section class='panel'><h2>비밀번호 재설정</h2><p class='muted'>아이디와 등록된 복구 정보를 확인한 뒤 새 비밀번호로 바로 바꿉니다.</p>"
+        "<form action='/account/password' method='post' class='stack' style='margin-top:16px;'>"
+        "<div><label>아이디</label><input name='username' autocomplete='username' required></div>"
+        "<div><label>이름</label><input name='full_name' required></div>"
+        "<div><label>연락처</label><input name='phone' inputmode='tel' required></div>"
+        "<div><label>복구 질문</label><input name='recovery_question' required></div>"
+        "<div><label>복구 답변</label><input name='recovery_answer' type='password' autocomplete='off' required></div>"
+        "<div><label>새 비밀번호</label><input name='new_password' type='password' autocomplete='new-password' required></div>"
+        "<div><label>새 비밀번호 확인</label><input name='new_password_confirm' type='password' autocomplete='new-password' required></div>"
+        "<div class='row-actions'><button class='btn primary' type='submit'>비밀번호 변경</button></div>"
+        "</form>"
+        + result_html
+        + "</section>"
+    )
+
+
 def _authorize(request: Request, permission: str | None = None):
     user = auth.get_user_by_session(request.cookies.get(auth.SESSION_COOKIE))
     if not user:
@@ -212,9 +345,9 @@ def _user_options(conn, *, include_viewers: bool = True) -> list[tuple[str, str]
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
-    user = auth.get_user_by_session(request.cookies.get(auth.SESSION_COOKIE))
-    if user:
-        return RedirectResponse(url="/", status_code=303)
+    redirect = _redirect_if_logged_in(request)
+    if redirect:
+        return redirect
 
     flash_message, flash_level = _flash_from_request(request)
     conn = get_conn()
@@ -243,6 +376,7 @@ def login_page(request: Request):
             "시설 운영 시스템 로그인",
             "공유 운영 환경을 위해 계정과 역할 기반으로 접근을 제어합니다.",
         )
+        + _auth_entry_links("login")
         + "<div class='layout-2'>"
         + "<section class='panel'>"
         + "<h2>로그인</h2><p class='muted'>현장 팀원별 계정으로 접속하세요.</p>"
@@ -256,6 +390,7 @@ def login_page(request: Request):
         """
         + "</section>"
         + "<div class='stack'>"
+        + info_box("계정 지원", "신규 사용자는 회원가입 후 관리자 승인으로 활성화할 수 있고, 아이디 찾기와 비밀번호 재설정은 등록된 연락처와 복구질문을 기준으로 처리됩니다.")
         + info_box("권한 모델", "관리자, 운영관리, 작업자, 조회전용 역할에 따라 화면 접근과 수정 범위가 나뉩니다.")
         + info_box("공유 운영", "시설 상태, 재고 변동, 작업 진행 내역은 사용자 계정 기준으로 남아 이후 감사와 보고서 자동화에 활용됩니다.")
         + "</div></div>"
@@ -293,6 +428,256 @@ def logout(request: Request):
     response = _with_flash("/login", "로그아웃되었습니다.", "info")
     response.delete_cookie(auth.SESSION_COOKIE)
     return response
+
+
+@app.get("/register", response_class=HTMLResponse)
+def register_page(request: Request):
+    redirect = _redirect_if_logged_in(request)
+    if redirect:
+        return redirect
+
+    flash_message, flash_level = _flash_from_request(request)
+    return _guest_page(
+        title="회원가입",
+        eyebrow="Account Onboarding",
+        heading="회원가입 요청",
+        description="현장 팀원 계정은 승인형으로 생성해 무분별한 권한 부여를 막습니다.",
+        active_tab="register",
+        main_panel=_register_panel(),
+        side_content=(
+            info_box("승인 방식", "회원가입으로 생성된 계정은 기본적으로 조회전용·비활성 상태입니다. 관리자가 확인 후 활성화와 역할을 지정합니다.")
+            + info_box("복구 정보", "아이디 찾기와 비밀번호 재설정은 가입 시 등록한 연락처와 복구 질문/답변을 기준으로 처리됩니다.")
+        ),
+        flash_message=flash_message,
+        flash_level=flash_level,
+    )
+
+
+@app.post("/register")
+def register_submit(
+    request: Request,
+    username: str = Form(...),
+    full_name: str = Form(...),
+    phone: str = Form(...),
+    password: str = Form(...),
+    password_confirm: str = Form(...),
+    recovery_question: str = Form(...),
+    recovery_answer: str = Form(...),
+):
+    redirect = _redirect_if_logged_in(request)
+    if redirect:
+        return redirect
+
+    username_v = username.strip()
+    full_name_v = full_name.strip()
+    phone_v = auth.normalize_phone(phone)
+    recovery_question_v = _normalize_recovery_question(recovery_question)
+    recovery_answer_v = recovery_answer.strip()
+    password_rule_error = _password_error(password)
+
+    if not username_v or not full_name_v or not phone_v or not recovery_question_v or not recovery_answer_v:
+        return _with_flash("/register", "모든 항목을 입력해 주세요.", "error")
+    if password_rule_error:
+        return _with_flash("/register", password_rule_error, "error")
+    if password != password_confirm:
+        return _with_flash("/register", "비밀번호 확인이 일치하지 않습니다.", "error")
+
+    conn = get_conn()
+    try:
+        username_exists = conn.execute(
+            "SELECT id FROM users WHERE username = ?",
+            (username_v,),
+        ).fetchone()
+        duplicate_person = conn.execute(
+            "SELECT id FROM users WHERE full_name = ? AND phone = ?",
+            (full_name_v, phone_v),
+        ).fetchone()
+        if username_exists:
+            conn.close()
+            return _with_flash("/register", "이미 사용 중인 아이디입니다.", "error")
+        if duplicate_person:
+            conn.close()
+            return _with_flash("/register", "같은 이름과 연락처로 등록된 계정이 이미 있습니다.", "error")
+
+        conn.execute(
+            """
+            INSERT INTO users(
+                username, full_name, role, password_hash, is_active, phone,
+                recovery_question, recovery_answer_hash, created_at, updated_at
+            )
+            VALUES (?, ?, 'viewer', ?, 0, ?, ?, ?, ?, ?)
+            """,
+            (
+                username_v,
+                full_name_v,
+                auth.hash_password(password.strip()),
+                phone_v,
+                recovery_question_v,
+                auth.hash_recovery_answer(recovery_answer_v),
+                _now_text(),
+                _now_text(),
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return _with_flash("/login", "회원가입 요청이 접수되었습니다. 관리자 승인 후 로그인할 수 있습니다.", "ok")
+    except Exception as exc:
+        conn.close()
+        return _with_flash("/register", f"회원가입 요청에 실패했습니다: {exc}", "error")
+
+
+@app.get("/account/username", response_class=HTMLResponse)
+def account_username_page(request: Request):
+    redirect = _redirect_if_logged_in(request)
+    if redirect:
+        return redirect
+
+    flash_message, flash_level = _flash_from_request(request)
+    return _guest_page(
+        title="아이디 찾기",
+        eyebrow="Account Recovery",
+        heading="아이디 찾기",
+        description="등록된 본인확인 정보가 일치하면 아이디를 확인할 수 있습니다.",
+        active_tab="username",
+        main_panel=_username_recovery_panel(),
+        side_content=(
+            info_box("입력 기준", "회원가입 또는 관리자 등록 시 저장한 연락처와 복구 질문/답변을 그대로 입력해야 합니다.")
+            + info_box("표시 방식", "보안을 위해 찾은 아이디는 일부만 마스킹해 보여주고, 상태도 함께 안내합니다.")
+        ),
+        flash_message=flash_message,
+        flash_level=flash_level,
+    )
+
+
+@app.post("/account/username", response_class=HTMLResponse)
+def account_username_submit(
+    request: Request,
+    full_name: str = Form(...),
+    phone: str = Form(...),
+    recovery_question: str = Form(...),
+    recovery_answer: str = Form(...),
+):
+    redirect = _redirect_if_logged_in(request)
+    if redirect:
+        return redirect
+
+    conn = get_conn()
+    user = _find_recovery_user(
+        conn,
+        full_name=full_name,
+        phone=phone,
+        recovery_question=recovery_question,
+    )
+    conn.close()
+
+    if not user or not user["recovery_answer_hash"] or not auth.verify_recovery_answer(recovery_answer, user["recovery_answer_hash"]):
+        return _guest_page(
+            title="아이디 찾기",
+            eyebrow="Account Recovery",
+            heading="아이디 찾기",
+            description="등록된 본인확인 정보가 일치하면 아이디를 확인할 수 있습니다.",
+            active_tab="username",
+            main_panel=_username_recovery_panel(),
+            side_content=(
+                info_box("입력 기준", "회원가입 또는 관리자 등록 시 저장한 연락처와 복구 질문/답변을 그대로 입력해야 합니다.")
+                + info_box("도움말", "복구 정보가 등록되지 않은 계정은 관리자가 연락처와 복구 질문을 먼저 저장해야 합니다.")
+            ),
+            flash_message="입력한 복구 정보와 일치하는 계정을 찾지 못했습니다.",
+            flash_level="error",
+        )
+
+    status_text = "활성" if user["is_active"] else "승인 대기"
+    result_html = (
+        "<section class='panel' style='margin-top:16px;'>"
+        "<h2>조회 결과</h2>"
+        f"<div class='muted'>아이디: <strong>{esc(_mask_username(user['username']))}</strong></div>"
+        f"<div class='muted' style='margin-top:8px;'>계정 상태: {esc(status_text)}</div>"
+        "</section>"
+    )
+    return _guest_page(
+        title="아이디 찾기",
+        eyebrow="Account Recovery",
+        heading="아이디 찾기",
+        description="등록된 본인확인 정보가 일치하면 아이디를 확인할 수 있습니다.",
+        active_tab="username",
+        main_panel=_username_recovery_panel(result_html),
+        side_content=(
+            info_box("다음 단계", "승인 대기 계정은 관리자가 활성화해야 로그인할 수 있습니다.")
+            + info_box("비밀번호가 기억나지 않으면", "비밀번호 재설정 화면에서 같은 복구 정보와 새 비밀번호를 입력하면 바로 변경할 수 있습니다.")
+        ),
+        flash_message="아이디를 확인했습니다.",
+        flash_level="ok",
+    )
+
+
+@app.get("/account/password", response_class=HTMLResponse)
+def account_password_page(request: Request):
+    redirect = _redirect_if_logged_in(request)
+    if redirect:
+        return redirect
+
+    flash_message, flash_level = _flash_from_request(request)
+    return _guest_page(
+        title="비밀번호 재설정",
+        eyebrow="Account Recovery",
+        heading="비밀번호 재설정",
+        description="메일 없이도 복구 정보가 맞으면 새 비밀번호로 직접 재설정할 수 있습니다.",
+        active_tab="password",
+        main_panel=_password_reset_panel(),
+        side_content=(
+            info_box("재설정 방식", "아이디, 이름, 연락처, 복구 질문과 답변이 모두 일치해야 비밀번호를 바꿀 수 있습니다.")
+            + info_box("보안 기준", "새 비밀번호는 8자 이상으로 설정해 주세요.")
+        ),
+        flash_message=flash_message,
+        flash_level=flash_level,
+    )
+
+
+@app.post("/account/password")
+def account_password_submit(
+    request: Request,
+    username: str = Form(...),
+    full_name: str = Form(...),
+    phone: str = Form(...),
+    recovery_question: str = Form(...),
+    recovery_answer: str = Form(...),
+    new_password: str = Form(...),
+    new_password_confirm: str = Form(...),
+):
+    redirect = _redirect_if_logged_in(request)
+    if redirect:
+        return redirect
+
+    password_rule_error = _password_error(new_password)
+    if password_rule_error:
+        return _with_flash("/account/password", password_rule_error, "error")
+    if new_password != new_password_confirm:
+        return _with_flash("/account/password", "새 비밀번호 확인이 일치하지 않습니다.", "error")
+
+    conn = get_conn()
+    user = _find_recovery_user(
+        conn,
+        username=username,
+        full_name=full_name,
+        phone=phone,
+        recovery_question=recovery_question,
+    )
+    if not user or not user["recovery_answer_hash"] or not auth.verify_recovery_answer(recovery_answer, user["recovery_answer_hash"]):
+        conn.close()
+        return _with_flash("/account/password", "입력한 복구 정보와 일치하는 계정을 찾지 못했습니다.", "error")
+
+    conn.execute(
+        """
+        UPDATE users
+        SET password_hash = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (auth.hash_password(new_password.strip()), _now_text(), user["id"]),
+    )
+    conn.commit()
+    conn.close()
+    auth.invalidate_user_sessions(user["id"])
+    return _with_flash("/login", "비밀번호가 재설정되었습니다. 새 비밀번호로 로그인해 주세요.", "ok")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1700,7 +2085,10 @@ def users_page(request: Request):
         f"<input type='hidden' name='user_id' value='{esc(edit_row['id'] if edit_row else '')}'>"
         + f"<div><label>아이디</label><input name='username' value='{esc(edit_row['username'] if edit_row else '')}' required></div>"
         + f"<div><label>이름</label><input name='full_name' value='{esc(edit_row['full_name'] if edit_row else '')}' required></div>"
+        + f"<div><label>연락처</label><input name='phone' value='{esc(edit_row['phone'] if edit_row else '')}' inputmode='tel' placeholder='01012345678'></div>"
         + f"<div><label>역할</label><select name='role'>{render_options(auth.role_options(), edit_row['role'] if edit_row else 'viewer')}</select></div>"
+        + f"<div><label>복구 질문</label><input name='recovery_question' value='{esc(edit_row['recovery_question'] if edit_row else '')}' placeholder='예: 가장 기억에 남는 근무지는?'></div>"
+        + f"<div><label>복구 답변{' (변경 시에만 입력)' if edit_row else ''}</label><input name='recovery_answer' type='password' {'placeholder=\"변경하지 않으려면 비워두기\"' if edit_row else ''}></div>"
         + f"<div><label>비밀번호{' (변경 시에만 입력)' if edit_row else ''}</label><input name='password' type='password' {'placeholder=\"변경하지 않으려면 비워두기\"' if edit_row else 'required'}></div>"
         + (
             f"<label style='display:flex;align-items:center;gap:8px;'><input name='is_active' type='checkbox' value='1' {'checked' if edit_row['is_active'] else ''} style='width:auto;'>활성 사용자</label>"
@@ -1719,23 +2107,27 @@ def users_page(request: Request):
                 <tr>
                   <td>{username}</td>
                   <td>{name}</td>
+                  <td>{phone}</td>
                   <td>{role}</td>
                   <td>{status}</td>
+                  <td>{recovery}</td>
                   <td>{created}</td>
                   <td>{actions}</td>
                 </tr>
                 """.format(
                     username=esc(row["username"]),
                     name=esc(row["full_name"]),
+                    phone=esc(row["phone"] or "-"),
                     role=esc(auth.ROLE_LABELS.get(row["role"], row["role"])),
                     status=status_badge("활성" if row["is_active"] else "비활성"),
+                    recovery=status_badge("설정됨" if row["recovery_answer_hash"] else "미설정"),
                     created=esc(fmt_datetime(row["created_at"])),
                     actions=f"<a class='btn secondary' href='/admin/users?edit={row['id']}'>수정</a>",
                 )
             )
         list_html = (
             "<section class='panel'><h2>사용자 목록</h2><table>"
-            "<thead><tr><th>아이디</th><th>이름</th><th>역할</th><th>상태</th><th>등록일</th><th>관리</th></tr></thead>"
+            "<thead><tr><th>아이디</th><th>이름</th><th>연락처</th><th>역할</th><th>상태</th><th>복구정보</th><th>등록일</th><th>관리</th></tr></thead>"
             f"<tbody>{''.join(rows_html)}</tbody></table></section>"
         )
     else:
@@ -1750,7 +2142,10 @@ def users_page(request: Request):
         )
         + "<div class='layout-2'>"
         + form_html
+        + "<div class='stack'>"
+        + info_box("복구 정보 운영", "연락처와 복구 질문/답변이 등록된 계정만 아이디 찾기와 비밀번호 재설정을 스스로 수행할 수 있습니다.")
         + list_html
+        + "</div>"
         + "</div>"
     )
     return HTMLResponse(layout(title="권한 관리", body=body, user=user, flash_message=flash_message, flash_level=flash_level))
@@ -1762,7 +2157,10 @@ def users_save(
     user_id: str = Form(""),
     username: str = Form(...),
     full_name: str = Form(...),
+    phone: str = Form(""),
     role: str = Form(...),
+    recovery_question: str = Form(""),
+    recovery_answer: str = Form(""),
     password: str = Form(""),
     is_active: str = Form(""),
 ):
@@ -1775,6 +2173,9 @@ def users_save(
 
     user_id_i = _parse_int(user_id, 0)
     active_value = 1 if _bool_from_form(is_active) else 0
+    phone_v = auth.normalize_phone(phone)
+    recovery_question_v = _normalize_recovery_question(recovery_question)
+    recovery_answer_v = recovery_answer.strip()
     conn = get_conn()
     try:
         if user_id_i:
@@ -1786,34 +2187,69 @@ def users_save(
                 conn.close()
                 return _with_flash(f"/admin/users?edit={user_id_i}", "현재 로그인한 계정은 비활성화할 수 없습니다.", "error")
 
+            if recovery_answer_v and not recovery_question_v:
+                conn.close()
+                return _with_flash(f"/admin/users?edit={user_id_i}", "복구 답변을 바꾸려면 복구 질문도 입력해 주세요.", "error")
+            if recovery_question_v != (target["recovery_question"] or "") and recovery_question_v and not recovery_answer_v:
+                conn.close()
+                return _with_flash(f"/admin/users?edit={user_id_i}", "복구 질문을 변경할 때는 새 복구 답변도 함께 입력해야 합니다.", "error")
+
+            if recovery_question_v == "" and recovery_answer_v == "":
+                recovery_answer_hash = ""
+            elif recovery_answer_v:
+                recovery_answer_hash = auth.hash_recovery_answer(recovery_answer_v)
+            else:
+                recovery_answer_hash = target["recovery_answer_hash"]
+
+            password_rule_error = _password_error(password) if password.strip() else ""
+            if password_rule_error:
+                conn.close()
+                return _with_flash(f"/admin/users?edit={user_id_i}", password_rule_error, "error")
+
             if password.strip():
                 conn.execute(
                     """
                     UPDATE users
-                    SET username = ?, full_name = ?, role = ?, password_hash = ?, is_active = ?, updated_at = ?
+                    SET username = ?, full_name = ?, phone = ?, role = ?, recovery_question = ?, recovery_answer_hash = ?,
+                        password_hash = ?, is_active = ?, updated_at = ?
                     WHERE id = ?
                     """,
                     (
                         username.strip(),
                         full_name.strip(),
+                        phone_v,
                         role,
+                        recovery_question_v,
+                        recovery_answer_hash,
                         auth.hash_password(password.strip()),
                         active_value,
                         _now_text(),
                         user_id_i,
                     ),
                 )
+                conn.commit()
+                conn.close()
+                auth.invalidate_user_sessions(user_id_i)
+                return _with_flash(
+                    f"/admin/users?edit={user_id_i}",
+                    "사용자 정보가 수정되었습니다. 기존 로그인 세션은 모두 종료되었습니다.",
+                    "ok",
+                )
             else:
                 conn.execute(
                     """
                     UPDATE users
-                    SET username = ?, full_name = ?, role = ?, is_active = ?, updated_at = ?
+                    SET username = ?, full_name = ?, phone = ?, role = ?, recovery_question = ?, recovery_answer_hash = ?,
+                        is_active = ?, updated_at = ?
                     WHERE id = ?
                     """,
                     (
                         username.strip(),
                         full_name.strip(),
+                        phone_v,
                         role,
+                        recovery_question_v,
+                        recovery_answer_hash,
                         active_value,
                         _now_text(),
                         user_id_i,
@@ -1826,17 +2262,30 @@ def users_save(
         if not password.strip():
             conn.close()
             return _with_flash("/admin/users", "신규 사용자는 비밀번호가 필요합니다.", "error")
+        password_rule_error = _password_error(password)
+        if password_rule_error:
+            conn.close()
+            return _with_flash("/admin/users", password_rule_error, "error")
+        if bool(recovery_question_v) != bool(recovery_answer_v):
+            conn.close()
+            return _with_flash("/admin/users", "복구 질문과 답변은 둘 다 입력하거나 둘 다 비워 두어야 합니다.", "error")
         conn.execute(
             """
-            INSERT INTO users(username, full_name, role, password_hash, is_active, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO users(
+                username, full_name, phone, role, password_hash, is_active,
+                recovery_question, recovery_answer_hash, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 username.strip(),
                 full_name.strip(),
+                phone_v,
                 role,
                 auth.hash_password(password.strip()),
                 active_value,
+                recovery_question_v,
+                auth.hash_recovery_answer(recovery_answer_v) if recovery_answer_v else "",
                 _now_text(),
                 _now_text(),
             ),

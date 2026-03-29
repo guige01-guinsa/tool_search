@@ -28,6 +28,16 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return bool(row)
 
 
+def _column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return any(row["name"] == column_name for row in rows)
+
+
+def _ensure_column(conn: sqlite3.Connection, table_name: str, column_sql: str, column_name: str) -> None:
+    if not _column_exists(conn, table_name, column_name):
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}")
+
+
 def init_db() -> None:
     conn = get_conn()
 
@@ -45,6 +55,10 @@ def init_db() -> None:
         )
         """
     )
+
+    _ensure_column(conn, "users", "phone TEXT NOT NULL DEFAULT ''", "phone")
+    _ensure_column(conn, "users", "recovery_question TEXT NOT NULL DEFAULT ''", "recovery_question")
+    _ensure_column(conn, "users", "recovery_answer_hash TEXT NOT NULL DEFAULT ''", "recovery_answer_hash")
 
     conn.execute(
         """
@@ -185,6 +199,7 @@ def init_db() -> None:
     )
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_facilities_status ON facilities(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_inventory_status ON inventory_items(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_inventory_location ON inventory_items(location)")

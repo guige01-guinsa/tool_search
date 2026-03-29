@@ -78,6 +78,20 @@ def should_show_bootstrap_password() -> bool:
     return not bool(_ENV_ADMIN_PASSWORD)
 
 
+def normalize_phone(phone: str) -> str:
+    return "".join(ch for ch in str(phone or "") if ch.isdigit())
+
+
+def hash_recovery_answer(answer: str) -> str:
+    return hash_password(answer.strip())
+
+
+def verify_recovery_answer(answer: str, stored_hash: str) -> bool:
+    if not stored_hash.strip():
+        return False
+    return verify_password(answer.strip(), stored_hash)
+
+
 def role_options() -> list[tuple[str, str]]:
     return [(key, label) for key, label in ROLE_LABELS.items()]
 
@@ -163,6 +177,13 @@ def invalidate_session(raw_token: str | None) -> None:
     token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
     conn = get_conn()
     conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
+    conn.commit()
+    conn.close()
+
+
+def invalidate_user_sessions(user_id: int) -> None:
+    conn = get_conn()
+    conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
 
