@@ -1,0 +1,1832 @@
+from __future__ import annotations
+
+import os
+import uuid
+from datetime import date, datetime
+from pathlib import Path
+from typing import Iterable, List
+from urllib.parse import urlencode
+
+from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+
+from ops import auth
+from ops.db import get_conn, init_db, migrate_legacy_tools
+from ops.ui import (
+    attachment_gallery,
+    empty_state,
+    esc,
+    fmt_date,
+    fmt_datetime,
+    info_box,
+    layout,
+    metric_card,
+    page_header,
+    render_options,
+    status_badge,
+)
+
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = BASE_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+app = FastAPI(title="시설 운영 시스템")
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+
+
+def _bootstrap() -> None:
+    init_db()
+    auth.ensure_admin_user()
+    conn = get_conn()
+    admin_user = conn.execute(
+        "SELECT id FROM users WHERE username = ?",
+        (auth.DEFAULT_ADMIN_USERNAME,),
+    ).fetchone()
+    conn.close()
+    migrate_legacy_tools(admin_user["id"] if admin_user else None)
+
+
+_bootstrap()
+
+
+def _now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _today_text() -> str:
+    return date.today().strftime("%Y-%m-%d")
+
+
+def _month_start_text() -> str:
+    today = date.today()
+    return today.replace(day=1).strftime("%Y-%m-%d")
+
+
+def _parse_int(value, default: int = 0) -> int:
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return default
+
+
+def _bool_from_form(value: str | None) -> bool:
+    return str(value or "").lower() in {"1", "true", "on", "yes"}
+
+
+def _with_flash(path: str, message: str = "", level: str = "info") -> RedirectResponse:
+    if message:
+        delimiter = "&" if "?" in path else "?"
+        path = f"{path}{delimiter}{urlencode({'msg': message, 'level': level})}"
+    return RedirectResponse(url=path, status_code=303)
+
+
+def _flash_from_request(request: Request) -> tuple[str, str]:
+    return request.query_params.get("msg", ""), request.query_params.get("level", "info")
+
+
+def _authorize(request: Request, permission: str | None = None):
+    user = auth.get_user_by_session(request.cookies.get(auth.SESSION_COOKIE))
+    if not user:
+        return None, RedirectResponse(url="/login", status_code=303)
+    if permission and not auth.has_permission(user["role"], permission):
+        body = (
+            page_header(
+                "Access Control",
+                "권한이 없습니다",
+                "현재 계정의 역할로는 이 화면이나 작업에 접근할 수 없습니다.",
+            )
+            + info_box("필요 조치", "관리자 계정으로 로그인하거나 현재 사용자 역할을 조정해 주세요.")
+        )
+        return (
+            None,
+            HTMLResponse(
+                layout(title="권한 없음", body=body, user=user, flash_message="접근 권한이 부족합니다.", flash_level="error"),
+                status_code=403,
+            ),
+        )
+    return user, None
+
+
+def _upload_file(file: UploadFile) -> str | None:
+    filename = (file.filename or "").strip()
+    if not filename:
+        return None
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+        ext = ".jpg"
+    saved_name = f"{uuid.uuid4().hex}{ext}"
+    target = UPLOAD_DIR / saved_name
+    with open(target, "wb") as handle:
+        handle.write(file.file.read())
+    return saved_name
+
+
+def _save_attachments(conn, entity_type: str, entity_id: int, files: Iterable[UploadFile], user_id: int | None) -> None:
+    for file in files:
+        saved_name = _upload_file(file)
+        if not saved_name:
+            continue
+        conn.execute(
+            """
+            INSERT INTO attachments(entity_type, entity_id, file_path, original_name, created_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (entity_type, entity_id, saved_name, file.filename or saved_name, user_id, _now_text()),
+        )
+
+
+def _attachment_map(conn, entity_type: str, entity_ids: list[int]) -> dict[int, list]:
+    if not entity_ids:
+        return {}
+    placeholders = ",".join(["?"] * len(entity_ids))
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM attachments
+        WHERE entity_type = ?
+          AND entity_id IN ({placeholders})
+        ORDER BY created_at DESC, id DESC
+        """,
+        [entity_type, *entity_ids],
+    ).fetchall()
+    result: dict[int, list] = {entity_id: [] for entity_id in entity_ids}
+    for row in rows:
+        result.setdefault(row["entity_id"], []).append(row)
+    return result
+
+
+def _delete_attachments(conn, entity_type: str, entity_id: int) -> None:
+    rows = conn.execute(
+        "SELECT file_path FROM attachments WHERE entity_type = ? AND entity_id = ?",
+        (entity_type, entity_id),
+    ).fetchall()
+    conn.execute(
+        "DELETE FROM attachments WHERE entity_type = ? AND entity_id = ?",
+        (entity_type, entity_id),
+    )
+    for row in rows:
+        file_path = UPLOAD_DIR / row["file_path"]
+        try:
+            if file_path.exists():
+                file_path.unlink()
+        except OSError:
+            pass
+
+
+def _compose_facility_location(row) -> str:
+    parts = [part.strip() for part in [row["building"], row["floor"], row["zone"]] if (part or "").strip()]
+    return " / ".join(parts) if parts else "-"
+
+
+def _facility_options(conn) -> list[tuple[str, str]]:
+    rows = conn.execute(
+        "SELECT id, facility_code, name FROM facilities ORDER BY name ASC, id ASC"
+    ).fetchall()
+    return [(str(row["id"]), f"{row['facility_code']} · {row['name']}") for row in rows]
+
+
+def _user_options(conn, *, include_viewers: bool = True) -> list[tuple[str, str]]:
+    sql = "SELECT id, full_name, role FROM users WHERE is_active = 1"
+    params: list = []
+    if not include_viewers:
+        sql += " AND role != ?"
+        params.append("viewer")
+    sql += " ORDER BY role ASC, full_name ASC"
+    rows = conn.execute(sql, params).fetchall()
+    return [(str(row["id"]), f"{row['full_name']} ({auth.ROLE_LABELS.get(row['role'], row['role'])})") for row in rows]
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request):
+    user = auth.get_user_by_session(request.cookies.get(auth.SESSION_COOKIE))
+    if user:
+        return RedirectResponse(url="/", status_code=303)
+
+    flash_message, flash_level = _flash_from_request(request)
+    conn = get_conn()
+    user_count = conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"]
+    conn.close()
+    hint = ""
+    if user_count == 1:
+        hint = (
+            "<div class='pill-row'>"
+            f"<span class='pill'>초기 관리자: {esc(auth.DEFAULT_ADMIN_USERNAME)}</span>"
+            f"<span class='pill'>초기 비밀번호: {esc(auth.DEFAULT_ADMIN_PASSWORD)}</span>"
+            "</div>"
+        )
+
+    body = (
+        page_header(
+            "Secure Entry",
+            "시설 운영 시스템 로그인",
+            "공유 운영 환경을 위해 계정과 역할 기반으로 접근을 제어합니다.",
+        )
+        + "<div class='layout-2'>"
+        + "<section class='panel'>"
+        + "<h2>로그인</h2><p class='muted'>현장 팀원별 계정으로 접속하세요.</p>"
+        + hint
+        + """
+          <form action="/login" method="post" class="stack" style="margin-top:16px;">
+            <div><label>아이디</label><input name="username" autocomplete="username" required></div>
+            <div><label>비밀번호</label><input name="password" type="password" autocomplete="current-password" required></div>
+            <div class="row-actions"><button class="btn primary" type="submit">로그인</button></div>
+          </form>
+        """
+        + "</section>"
+        + "<div class='stack'>"
+        + info_box("권한 모델", "관리자, 운영관리, 작업자, 조회전용 역할에 따라 화면 접근과 수정 범위가 나뉩니다.")
+        + info_box("공유 운영", "시설 상태, 재고 변동, 작업 진행 내역은 사용자 계정 기준으로 남아 이후 감사와 보고서 자동화에 활용됩니다.")
+        + "</div></div>"
+    )
+    return HTMLResponse(layout(title="로그인", body=body, flash_message=flash_message, flash_level=flash_level))
+
+
+@app.post("/login")
+def login_submit(username: str = Form(...), password: str = Form(...)):
+    conn = get_conn()
+    user = conn.execute(
+        "SELECT * FROM users WHERE username = ?",
+        (username.strip(),),
+    ).fetchone()
+    conn.close()
+    if not user or not user["is_active"] or not auth.verify_password(password, user["password_hash"]):
+        return _with_flash("/login", "아이디 또는 비밀번호가 올바르지 않습니다.", "error")
+
+    token = auth.create_session(user["id"])
+    response = _with_flash("/", "로그인되었습니다.", "ok")
+    response.set_cookie(
+        auth.SESSION_COOKIE,
+        token,
+        httponly=True,
+        samesite="lax",
+        max_age=7 * 24 * 60 * 60,
+    )
+    return response
+
+
+@app.post("/logout")
+def logout(request: Request):
+    auth.invalidate_session(request.cookies.get(auth.SESSION_COOKIE))
+    response = _with_flash("/login", "로그아웃되었습니다.", "info")
+    response.delete_cookie(auth.SESSION_COOKIE)
+    return response
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard(request: Request):
+    user, error = _authorize(request, "dashboard:view")
+    if error:
+        return error
+
+    conn = get_conn()
+    total_facilities = conn.execute("SELECT COUNT(*) AS count FROM facilities").fetchone()["count"]
+    active_facilities = conn.execute(
+        "SELECT COUNT(*) AS count FROM facilities WHERE status = '운영중'"
+    ).fetchone()["count"]
+    total_items = conn.execute("SELECT COUNT(*) AS count FROM inventory_items").fetchone()["count"]
+    low_stock = conn.execute(
+        "SELECT COUNT(*) AS count FROM inventory_items WHERE quantity <= min_quantity"
+    ).fetchone()["count"]
+    open_work = conn.execute(
+        "SELECT COUNT(*) AS count FROM work_orders WHERE status NOT IN ('완료', '종결')"
+    ).fetchone()["count"]
+    overdue_work = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM work_orders
+        WHERE due_date != ''
+          AND due_date < ?
+          AND status NOT IN ('완료', '종결')
+        """,
+        (_today_text(),),
+    ).fetchone()["count"]
+    active_users = conn.execute(
+        "SELECT COUNT(*) AS count FROM users WHERE is_active = 1"
+    ).fetchone()["count"]
+    today_completed = conn.execute(
+        "SELECT COUNT(*) AS count FROM work_orders WHERE completed_at LIKE ?",
+        (f"{_today_text()}%",),
+    ).fetchone()["count"]
+
+    recent_work_orders = conn.execute(
+        """
+        SELECT w.*, f.name AS facility_name, u.full_name AS assignee_name
+        FROM work_orders w
+        LEFT JOIN facilities f ON f.id = w.facility_id
+        LEFT JOIN users u ON u.id = w.assignee_user_id
+        ORDER BY w.updated_at DESC, w.id DESC
+        LIMIT 8
+        """
+    ).fetchall()
+
+    recent_transactions = conn.execute(
+        """
+        SELECT t.*, i.item_code, i.name AS item_name, u.full_name AS actor_name
+        FROM inventory_transactions t
+        JOIN inventory_items i ON i.id = t.item_id
+        LEFT JOIN users u ON u.id = t.actor_user_id
+        ORDER BY t.created_at DESC, t.id DESC
+        LIMIT 8
+        """
+    ).fetchall()
+    conn.close()
+
+    metrics = (
+        "<section class='metrics'>"
+        + metric_card("시설", total_facilities, f"운영중 {active_facilities}개")
+        + metric_card("재고 항목", total_items, f"부족 경고 {low_stock}건")
+        + metric_card("미완료 작업", open_work, f"지연 {overdue_work}건")
+        + metric_card("활성 사용자", active_users, f"오늘 완료 {today_completed}건")
+        + "</section>"
+    )
+
+    if recent_work_orders:
+        work_rows = "".join(
+            """
+            <tr>
+              <td>{code}</td>
+              <td><strong>{title}</strong><div class='muted'>{facility}</div></td>
+              <td>{priority}<div style='margin-top:6px'>{status}</div></td>
+              <td>{assignee}</td>
+              <td>{due}</td>
+            </tr>
+            """.format(
+                code=esc(row["work_code"]),
+                title=esc(row["title"]),
+                facility=esc(row["facility_name"] or "시설 미지정"),
+                priority=status_badge(row["priority"]),
+                status=status_badge(row["status"]),
+                assignee=esc(row["assignee_name"] or "미배정"),
+                due=esc(fmt_date(row["due_date"])),
+            )
+            for row in recent_work_orders
+        )
+        work_table = (
+            "<section class='panel'><div class='split'><h2>최근 작업지시</h2>"
+            "<a class='btn secondary' href='/work-orders'>전체 보기</a></div>"
+            "<table><thead><tr><th>번호</th><th>작업</th><th>우선도/상태</th><th>담당</th><th>기한</th></tr></thead>"
+            f"<tbody>{work_rows}</tbody></table></section>"
+        )
+    else:
+        work_table = "<section class='panel'><h2>최근 작업지시</h2>" + empty_state("등록된 작업지시가 없습니다.") + "</section>"
+
+    if recent_transactions:
+        tx_rows = "".join(
+            """
+            <tr>
+              <td>{when}</td>
+              <td><strong>{item}</strong><div class='muted'>{code}</div></td>
+              <td>{tx_type}</td>
+              <td>{delta}</td>
+              <td>{actor}</td>
+              <td>{reason}</td>
+            </tr>
+            """.format(
+                when=esc(fmt_datetime(row["created_at"])),
+                item=esc(row["item_name"]),
+                code=esc(row["item_code"]),
+                tx_type=status_badge(row["tx_type"]),
+                delta=esc(f"{row['quantity_delta']:+d}"),
+                actor=esc(row["actor_name"] or "system"),
+                reason=esc(row["reason"] or "-"),
+            )
+            for row in recent_transactions
+        )
+        tx_table = (
+            "<section class='panel'><div class='split'><h2>최근 재고 변동</h2>"
+            "<a class='btn secondary' href='/inventory'>재고 관리</a></div>"
+            "<table><thead><tr><th>시각</th><th>품목</th><th>유형</th><th>변동</th><th>처리자</th><th>사유</th></tr></thead>"
+            f"<tbody>{tx_rows}</tbody></table></section>"
+        )
+    else:
+        tx_table = "<section class='panel'><h2>최근 재고 변동</h2>" + empty_state("재고 변동 이력이 없습니다.") + "</section>"
+
+    flash_message, flash_level = _flash_from_request(request)
+    body = (
+        page_header(
+            "Operations Overview",
+            "공동 운영용 시설 관리 대시보드",
+            "9명까지 동시에 쓰는 환경을 기준으로 시설, 재고, 작업지시, 보고서를 한 흐름으로 묶었습니다.",
+            actions=(
+                "<a class='btn primary' href='/work-orders'>작업지시 바로가기</a>"
+                "<a class='btn secondary' href='/reports'>운영 보고서</a>"
+            ),
+        )
+        + metrics
+        + "<div class='layout-2'>"
+        + "<div class='stack'>"
+        + info_box(
+            "운영 원칙",
+            "시설 상태는 위치 중심으로, 재고는 수불 이력 중심으로, 작업지시는 조치 내역 중심으로 관리합니다.",
+        )
+        + info_box(
+            "초기 계정",
+            f"최초 관리자 계정은 {auth.DEFAULT_ADMIN_USERNAME} / {auth.DEFAULT_ADMIN_PASSWORD} 입니다. 접속 후 즉시 비밀번호를 변경해 주세요.",
+        )
+        + "</div>"
+        + "<div class='stack'>"
+        + work_table
+        + tx_table
+        + "</div></div>"
+    )
+    return HTMLResponse(layout(title="대시보드", body=body, user=user, flash_message=flash_message, flash_level=flash_level))
+
+
+@app.get("/facilities", response_class=HTMLResponse)
+def facilities_page(request: Request):
+    user, error = _authorize(request, "facilities:view")
+    if error:
+        return error
+
+    can_edit = auth.has_permission(user["role"], "facilities:edit")
+    q = request.query_params.get("q", "").strip()
+    status = request.query_params.get("status", "").strip()
+    edit_id = _parse_int(request.query_params.get("edit", ""), 0)
+
+    conn = get_conn()
+    where = []
+    params: list = []
+    if q:
+        where.append(
+            "(f.facility_code LIKE ? OR f.name LIKE ? OR f.building LIKE ? OR f.floor LIKE ? OR f.zone LIKE ? OR f.note LIKE ?)"
+        )
+        params.extend([f"%{q}%"] * 6)
+    if status:
+        where.append("f.status = ?")
+        params.append(status)
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+
+    rows = conn.execute(
+        f"""
+        SELECT f.*, u.full_name AS manager_name
+        FROM facilities f
+        LEFT JOIN users u ON u.id = f.manager_user_id
+        {where_sql}
+        ORDER BY f.updated_at DESC, f.id DESC
+        """,
+        params,
+    ).fetchall()
+    attachments = _attachment_map(conn, "facility", [row["id"] for row in rows])
+    edit_row = None
+    if edit_id:
+        edit_row = conn.execute("SELECT * FROM facilities WHERE id = ?", (edit_id,)).fetchone()
+    manager_options = _user_options(conn)
+    conn.close()
+
+    status_options = ["운영중", "점검필요", "보수중", "사용중지"]
+    category_options = ["전기", "기계", "소방", "건축", "공용", "기타", "레거시 위치"]
+    form_html = ""
+    if can_edit:
+        form_html = (
+            "<section class='panel'><h2>시설 등록 / 수정</h2><p class='muted'>시설 단위로 위치와 상태, 담당자를 관리합니다.</p>"
+            "<form action='/facilities/save' method='post' enctype='multipart/form-data' class='stack'>"
+            f"<input type='hidden' name='facility_id' value='{esc(edit_row['id'] if edit_row else '')}'>"
+            + (
+                f"<div><label>시설 코드</label><input value='{esc(edit_row['facility_code'])}' disabled></div>"
+                if edit_row
+                else ""
+            )
+            + f"<div><label>분류</label><select name='category'>{render_options(category_options, edit_row['category'] if edit_row else '', blank_label='선택')}</select></div>"
+            + f"<div><label>시설명</label><input name='name' value='{esc(edit_row['name'] if edit_row else '')}' required></div>"
+            + "<div class='grid two'>"
+            + f"<div><label>동/건물</label><input name='building' value='{esc(edit_row['building'] if edit_row else '')}'></div>"
+            + f"<div><label>층/영역</label><input name='floor' value='{esc(edit_row['floor'] if edit_row else '')}'></div>"
+            + "</div>"
+            + f"<div><label>세부 위치</label><input name='zone' value='{esc(edit_row['zone'] if edit_row else '')}' placeholder='예: 기계실 A구역 / 분전반 전면'></div>"
+            + f"<div><label>상태</label><select name='status'>{render_options(status_options, edit_row['status'] if edit_row else '운영중')}</select></div>"
+            + f"<div><label>담당자</label><select name='manager_user_id'>{render_options(manager_options, str(edit_row['manager_user_id'] or '') if edit_row else '', blank_label='미지정')}</select></div>"
+            + f"<div><label>비고</label><textarea name='note'>{esc(edit_row['note'] if edit_row else '')}</textarea></div>"
+            + "<div><label>첨부 이미지</label><input name='files' type='file' accept='image/*' multiple></div>"
+            + "<div class='row-actions'>"
+            + "<button class='btn primary' type='submit'>저장</button>"
+            + "<a class='btn secondary' href='/facilities'>새로 입력</a>"
+            + (
+                f"<form action='/facilities/delete/{edit_row['id']}' method='post' onsubmit=\"return confirm('시설을 삭제하시겠습니까?');\"><button class='btn danger' type='submit'>삭제</button></form>"
+                if edit_row
+                else ""
+            )
+            + "</div></form>"
+        )
+        if edit_row:
+            form_html += "<div style='margin-top:14px'><label>현재 첨부</label>" + attachment_gallery(attachments.get(edit_row["id"], [])) + "</div>"
+        form_html += "</section>"
+    else:
+        form_html = info_box("읽기 전용", "현재 계정은 시설 조회 권한만 있습니다. 수정은 운영관리 이상 역할이 필요합니다.")
+
+    if rows:
+        body_rows = []
+        for row in rows:
+            actions = f"<a class='btn secondary' href='/facilities?edit={row['id']}'>상세/수정</a>" if can_edit else "<span class='muted'>조회</span>"
+            body_rows.append(
+                """
+                <tr>
+                  <td>{code}</td>
+                  <td><strong>{name}</strong><div class='muted'>{category}</div></td>
+                  <td>{location}</td>
+                  <td>{status}</td>
+                  <td>{manager}</td>
+                  <td>{updated}</td>
+                  <td>{attachments}</td>
+                  <td>{actions}</td>
+                </tr>
+                """.format(
+                    code=esc(row["facility_code"]),
+                    name=esc(row["name"]),
+                    category=esc(row["category"] or "-"),
+                    location=esc(_compose_facility_location(row)),
+                    status=status_badge(row["status"]),
+                    manager=esc(row["manager_name"] or "미지정"),
+                    updated=esc(fmt_datetime(row["updated_at"])),
+                    attachments=attachment_gallery(attachments.get(row["id"], [])),
+                    actions=actions,
+                )
+            )
+        list_html = (
+            "<section class='panel'><div class='split'><div><h2>시설 목록</h2><p class='muted'>상태와 담당자 기준으로 관리합니다.</p></div>"
+            "<form class='inline-form' method='get' action='/facilities'>"
+            f"<input name='q' value='{esc(q)}' placeholder='코드, 시설명, 위치 검색'>"
+            f"<select name='status'>{render_options(status_options, status, blank_label='전체 상태')}</select>"
+            "<button class='btn secondary' type='submit'>검색</button>"
+            "</form></div>"
+            "<table><thead><tr><th>코드</th><th>시설</th><th>위치</th><th>상태</th><th>담당</th><th>수정일</th><th>첨부</th><th>관리</th></tr></thead>"
+            f"<tbody>{''.join(body_rows)}</tbody></table></section>"
+        )
+    else:
+        list_html = "<section class='panel'><h2>시설 목록</h2>" + empty_state("검색 조건에 맞는 시설이 없습니다.") + "</section>"
+
+    flash_message, flash_level = _flash_from_request(request)
+    body = (
+        page_header(
+            "Facility Registry",
+            "시설 관리",
+            "설비 위치를 표준화해 작업지시와 보고서의 기준 데이터로 사용합니다.",
+        )
+        + "<div class='layout-2'>"
+        + form_html
+        + list_html
+        + "</div>"
+    )
+    return HTMLResponse(layout(title="시설 관리", body=body, user=user, flash_message=flash_message, flash_level=flash_level))
+
+
+@app.post("/facilities/save")
+def facilities_save(
+    request: Request,
+    facility_id: str = Form(""),
+    category: str = Form(""),
+    name: str = Form(...),
+    building: str = Form(""),
+    floor: str = Form(""),
+    zone: str = Form(""),
+    status: str = Form("운영중"),
+    manager_user_id: str = Form(""),
+    note: str = Form(""),
+    files: List[UploadFile] = File(default=[]),
+):
+    user, error = _authorize(request, "facilities:edit")
+    if error:
+        return error
+
+    facility_id_i = _parse_int(facility_id, 0)
+    manager_id_i = _parse_int(manager_user_id, 0) or None
+    conn = get_conn()
+    if facility_id_i:
+        conn.execute(
+            """
+            UPDATE facilities
+            SET category = ?, name = ?, building = ?, floor = ?, zone = ?, status = ?, manager_user_id = ?, note = ?,
+                updated_by = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                category.strip(),
+                name.strip(),
+                building.strip(),
+                floor.strip(),
+                zone.strip(),
+                status.strip(),
+                manager_id_i,
+                note.strip(),
+                user["id"],
+                _now_text(),
+                facility_id_i,
+            ),
+        )
+        _save_attachments(conn, "facility", facility_id_i, files, user["id"])
+        conn.commit()
+        conn.close()
+        return _with_flash(f"/facilities?edit={facility_id_i}", "시설 정보가 수정되었습니다.", "ok")
+
+    cursor = conn.execute(
+        """
+        INSERT INTO facilities(
+            facility_code, category, name, building, floor, zone, status, manager_user_id, note,
+            created_by, updated_by, created_at, updated_at
+        )
+        VALUES ('', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            category.strip(),
+            name.strip(),
+            building.strip(),
+            floor.strip(),
+            zone.strip(),
+            status.strip(),
+            manager_id_i,
+            note.strip(),
+            user["id"],
+            user["id"],
+            _now_text(),
+            _now_text(),
+        ),
+    )
+    facility_id_i = cursor.lastrowid
+    conn.execute("UPDATE facilities SET facility_code = ? WHERE id = ?", (f"FAC-{facility_id_i:04d}", facility_id_i))
+    _save_attachments(conn, "facility", facility_id_i, files, user["id"])
+    conn.commit()
+    conn.close()
+    return _with_flash(f"/facilities?edit={facility_id_i}", "시설이 등록되었습니다.", "ok")
+
+
+@app.post("/facilities/delete/{facility_id}")
+def facilities_delete(request: Request, facility_id: int):
+    user, error = _authorize(request, "facilities:edit")
+    if error:
+        return error
+    conn = get_conn()
+    _delete_attachments(conn, "facility", facility_id)
+    conn.execute("UPDATE work_orders SET facility_id = NULL WHERE facility_id = ?", (facility_id,))
+    conn.execute("DELETE FROM facilities WHERE id = ?", (facility_id,))
+    conn.commit()
+    conn.close()
+    return _with_flash("/facilities", "시설이 삭제되었습니다.", "ok")
+
+
+@app.get("/inventory", response_class=HTMLResponse)
+def inventory_page(request: Request):
+    user, error = _authorize(request, "inventory:view")
+    if error:
+        return error
+
+    can_edit = auth.has_permission(user["role"], "inventory:edit")
+    can_tx = auth.has_permission(user["role"], "inventory:transact")
+    q = request.query_params.get("q", "").strip()
+    status = request.query_params.get("status", "").strip()
+    category = request.query_params.get("category", "").strip()
+    low_only = request.query_params.get("low_only", "").strip() == "1"
+    edit_id = _parse_int(request.query_params.get("edit", ""), 0)
+
+    conn = get_conn()
+    where = []
+    params: list = []
+    if q:
+        where.append("(item_code LIKE ? OR name LIKE ? OR specification LIKE ? OR location LIKE ? OR note LIKE ?)")
+        params.extend([f"%{q}%"] * 5)
+    if status:
+        where.append("status = ?")
+        params.append(status)
+    if category:
+        where.append("category = ?")
+        params.append(category)
+    if low_only:
+        where.append("quantity <= min_quantity")
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+
+    items = conn.execute(
+        f"""
+        SELECT *
+        FROM inventory_items
+        {where_sql}
+        ORDER BY (quantity <= min_quantity) DESC, updated_at DESC, id DESC
+        """,
+        params,
+    ).fetchall()
+    attachments = _attachment_map(conn, "inventory", [row["id"] for row in items])
+    edit_row = conn.execute("SELECT * FROM inventory_items WHERE id = ?", (edit_id,)).fetchone() if edit_id else None
+    tx_rows = (
+        conn.execute(
+            """
+            SELECT t.*, u.full_name AS actor_name
+            FROM inventory_transactions t
+            LEFT JOIN users u ON u.id = t.actor_user_id
+            WHERE t.item_id = ?
+            ORDER BY t.created_at DESC, t.id DESC
+            LIMIT 10
+            """,
+            (edit_id,),
+        ).fetchall()
+        if edit_id
+        else []
+    )
+    conn.close()
+
+    status_options = ["정상", "부족", "점검필요", "폐기대기"]
+    category_options = ["전기", "기계", "소방", "건축", "사무", "안전", "레거시 이관", "기타"]
+    form_html = ""
+    if can_edit:
+        form_html = (
+            "<section class='panel'><h2>재고 품목 등록 / 수정</h2><p class='muted'>품목 기준정보를 관리하고 수불 이력을 누적합니다.</p>"
+            "<form action='/inventory/save' method='post' enctype='multipart/form-data' class='stack'>"
+            f"<input type='hidden' name='item_id' value='{esc(edit_row['id'] if edit_row else '')}'>"
+            + (
+                f"<div><label>품목 코드</label><input value='{esc(edit_row['item_code'])}' disabled></div>"
+                if edit_row
+                else ""
+            )
+            + f"<div><label>분류</label><select name='category'>{render_options(category_options, edit_row['category'] if edit_row else '', blank_label='선택')}</select></div>"
+            + f"<div><label>품목명</label><input name='name' value='{esc(edit_row['name'] if edit_row else '')}' required></div>"
+            + f"<div><label>규격 / 사양</label><input name='specification' value='{esc(edit_row['specification'] if edit_row else '')}'></div>"
+            + "<div class='grid two'>"
+            + f"<div><label>현재 수량</label><input name='quantity' type='number' min='0' value='{esc(edit_row['quantity'] if edit_row else 0)}'></div>"
+            + f"<div><label>최소 수량</label><input name='min_quantity' type='number' min='0' value='{esc(edit_row['min_quantity'] if edit_row else 0)}'></div>"
+            + "</div>"
+            + "<div class='grid two'>"
+            + f"<div><label>단위</label><input name='unit' value='{esc(edit_row['unit'] if edit_row else '개')}'></div>"
+            + f"<div><label>상태</label><select name='status'>{render_options(status_options, edit_row['status'] if edit_row else '정상')}</select></div>"
+            + "</div>"
+            + "<div class='grid two'>"
+            + f"<div><label>보관 위치</label><input name='location' value='{esc(edit_row['location'] if edit_row else '')}'></div>"
+            + f"<div><label>구매일자</label><input name='purchase_date' type='date' value='{esc(fmt_date(edit_row['purchase_date']) if edit_row else '')}'></div>"
+            + "</div>"
+            + f"<div><label>구매금액(원)</label><input name='purchase_amount' type='number' min='0' value='{esc(edit_row['purchase_amount'] if edit_row else 0)}'></div>"
+            + f"<div><label>비고</label><textarea name='note'>{esc(edit_row['note'] if edit_row else '')}</textarea></div>"
+            + "<div><label>첨부 이미지</label><input name='files' type='file' accept='image/*' multiple></div>"
+            + "<div class='row-actions'>"
+            + "<button class='btn primary' type='submit'>저장</button>"
+            + "<a class='btn secondary' href='/inventory'>새로 입력</a>"
+            + (
+                f"<form action='/inventory/delete/{edit_row['id']}' method='post' onsubmit=\"return confirm('재고 품목을 삭제하시겠습니까?');\"><button class='btn danger' type='submit'>삭제</button></form>"
+                if edit_row and can_edit
+                else ""
+            )
+            + "</div></form>"
+        )
+        if edit_row:
+            form_html += "<div style='margin-top:14px'><label>현재 첨부</label>" + attachment_gallery(attachments.get(edit_row["id"], [])) + "</div>"
+        if edit_row and can_tx:
+            tx_history = (
+                "".join(
+                    """
+                    <tr>
+                      <td>{when}</td>
+                      <td>{type}</td>
+                      <td>{delta}</td>
+                      <td>{actor}</td>
+                      <td>{reason}</td>
+                    </tr>
+                    """.format(
+                        when=esc(fmt_datetime(tx["created_at"])),
+                        type=status_badge(tx["tx_type"]),
+                        delta=esc(f"{tx['quantity_delta']:+d}"),
+                        actor=esc(tx["actor_name"] or "system"),
+                        reason=esc(tx["reason"] or "-"),
+                    )
+                    for tx in tx_rows
+                )
+                if tx_rows
+                else "<tr><td colspan='5' class='muted'>수불 이력이 없습니다.</td></tr>"
+            )
+            form_html += (
+                "<div class='panel' style='margin-top:16px; padding:0; border:none; box-shadow:none;'>"
+                "<h3>수불 처리</h3><p class='muted'>입고/반출/조정은 이력으로 남고 수량이 자동 갱신됩니다.</p>"
+                f"<form action='/inventory/tx/{edit_row['id']}' method='post' class='stack'>"
+                "<div class='grid two'>"
+                f"<div><label>처리 유형</label><select name='tx_type'>{render_options(['입고', '반출', '반납', '사용', '조정'], '입고')}</select></div>"
+                "<div><label>수량</label><input name='quantity' type='number' required></div>"
+                "</div>"
+                "<div><label>사유</label><input name='reason' placeholder='예: 작업지시 WO-0003 사용'></div>"
+                "<div class='row-actions'><button class='btn warn' type='submit'>수불 반영</button></div>"
+                "</form>"
+                "<div style='margin-top:14px'><h3>최근 수불 이력</h3>"
+                "<table><thead><tr><th>시각</th><th>유형</th><th>수량</th><th>처리자</th><th>사유</th></tr></thead>"
+                f"<tbody>{tx_history}</tbody></table></div></div>"
+            )
+        form_html += "</section>"
+    else:
+        form_html = info_box("읽기 전용", "현재 계정은 재고 조회만 가능합니다. 수불 반영은 작업자 이상 권한이 필요합니다.")
+
+    if items:
+        rows_html = []
+        for row in items:
+            actions = []
+            if can_edit:
+                actions.append(f"<a class='btn secondary' href='/inventory?edit={row['id']}'>상세/수정</a>")
+            elif can_tx:
+                actions.append(f"<a class='btn secondary' href='/inventory?edit={row['id']}'>수불 처리</a>")
+            else:
+                actions.append("<span class='muted'>조회</span>")
+            rows_html.append(
+                """
+                <tr>
+                  <td>{code}</td>
+                  <td><strong>{name}</strong><div class='muted'>{spec}</div></td>
+                  <td>{category}</td>
+                  <td>{qty}<div class='muted'>최소 {min_qty}</div></td>
+                  <td>{status}</td>
+                  <td>{location}</td>
+                  <td>{attachments}</td>
+                  <td>{actions}</td>
+                </tr>
+                """.format(
+                    code=esc(row["item_code"]),
+                    name=esc(row["name"]),
+                    spec=esc(row["specification"] or "-"),
+                    category=esc(row["category"] or "-"),
+                    qty=esc(f"{row['quantity']} {row['unit']}"),
+                    min_qty=esc(f"{row['min_quantity']} {row['unit']}"),
+                    status=status_badge("부족" if row["quantity"] <= row["min_quantity"] else row["status"]),
+                    location=esc(row["location"] or "-"),
+                    attachments=attachment_gallery(attachments.get(row["id"], [])),
+                    actions="".join(actions),
+                )
+            )
+        list_html = (
+            "<section class='panel'><div class='split'><div><h2>재고 목록</h2><p class='muted'>부족 경고 기준과 실제 수량을 함께 확인합니다.</p></div>"
+            "<form class='inline-form' method='get' action='/inventory'>"
+            f"<input name='q' value='{esc(q)}' placeholder='코드, 품목명, 위치 검색'>"
+            f"<select name='status'>{render_options(status_options, status, blank_label='전체 상태')}</select>"
+            f"<select name='category'>{render_options(category_options, category, blank_label='전체 분류')}</select>"
+            f"<label style='display:flex;gap:8px;align-items:center;margin:0;'><input name='low_only' type='checkbox' value='1' {'checked' if low_only else ''} style='width:auto;'>부족만</label>"
+            "<button class='btn secondary' type='submit'>검색</button>"
+            "</form></div>"
+            "<table><thead><tr><th>코드</th><th>품목</th><th>분류</th><th>수량</th><th>상태</th><th>위치</th><th>첨부</th><th>관리</th></tr></thead>"
+            f"<tbody>{''.join(rows_html)}</tbody></table></section>"
+        )
+    else:
+        list_html = "<section class='panel'><h2>재고 목록</h2>" + empty_state("조건에 맞는 재고 품목이 없습니다.") + "</section>"
+
+    flash_message, flash_level = _flash_from_request(request)
+    body = (
+        page_header(
+            "Inventory Control",
+            "재고 관리",
+            "재고 품목과 수불 이력을 분리해, 단순 숫자 수정이 아니라 변화 내역이 남는 구조로 전환했습니다.",
+        )
+        + "<div class='layout-2'>"
+        + form_html
+        + list_html
+        + "</div>"
+    )
+    return HTMLResponse(layout(title="재고 관리", body=body, user=user, flash_message=flash_message, flash_level=flash_level))
+
+
+@app.post("/inventory/save")
+def inventory_save(
+    request: Request,
+    item_id: str = Form(""),
+    category: str = Form(""),
+    name: str = Form(...),
+    specification: str = Form(""),
+    quantity: str = Form("0"),
+    unit: str = Form("개"),
+    location: str = Form(""),
+    status: str = Form("정상"),
+    min_quantity: str = Form("0"),
+    purchase_date: str = Form(""),
+    purchase_amount: str = Form("0"),
+    note: str = Form(""),
+    files: List[UploadFile] = File(default=[]),
+):
+    user, error = _authorize(request, "inventory:edit")
+    if error:
+        return error
+
+    item_id_i = _parse_int(item_id, 0)
+    quantity_i = max(0, _parse_int(quantity, 0))
+    min_quantity_i = max(0, _parse_int(min_quantity, 0))
+    purchase_amount_i = max(0, _parse_int(purchase_amount, 0))
+    conn = get_conn()
+    derived_status = status.strip() or "정상"
+    if derived_status in {"정상", "부족"}:
+        derived_status = "부족" if quantity_i <= min_quantity_i else "정상"
+
+    if item_id_i:
+        conn.execute(
+            """
+            UPDATE inventory_items
+            SET category = ?, name = ?, specification = ?, quantity = ?, unit = ?, location = ?, status = ?,
+                min_quantity = ?, purchase_date = ?, purchase_amount = ?, note = ?, updated_by = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                category.strip(),
+                name.strip(),
+                specification.strip(),
+                quantity_i,
+                unit.strip() or "개",
+                location.strip(),
+                derived_status,
+                min_quantity_i,
+                purchase_date.strip(),
+                purchase_amount_i,
+                note.strip(),
+                user["id"],
+                _now_text(),
+                item_id_i,
+            ),
+        )
+        _save_attachments(conn, "inventory", item_id_i, files, user["id"])
+        conn.commit()
+        conn.close()
+        return _with_flash(f"/inventory?edit={item_id_i}", "재고 품목이 수정되었습니다.", "ok")
+
+    cursor = conn.execute(
+        """
+        INSERT INTO inventory_items(
+            item_code, category, name, specification, quantity, unit, location, status, min_quantity,
+            purchase_date, purchase_amount, note, created_by, updated_by, created_at, updated_at
+        )
+        VALUES ('', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            category.strip(),
+            name.strip(),
+            specification.strip(),
+            quantity_i,
+            unit.strip() or "개",
+            location.strip(),
+            derived_status,
+            min_quantity_i,
+            purchase_date.strip(),
+            purchase_amount_i,
+            note.strip(),
+            user["id"],
+            user["id"],
+            _now_text(),
+            _now_text(),
+        ),
+    )
+    item_id_i = cursor.lastrowid
+    conn.execute("UPDATE inventory_items SET item_code = ? WHERE id = ?", (f"INV-{item_id_i:04d}", item_id_i))
+    if quantity_i:
+        conn.execute(
+            """
+            INSERT INTO inventory_transactions(item_id, tx_type, quantity_delta, reason, actor_user_id, created_at)
+            VALUES (?, '초기등록', ?, ?, ?, ?)
+            """,
+            (item_id_i, quantity_i, "초기 재고 등록", user["id"], _now_text()),
+        )
+    _save_attachments(conn, "inventory", item_id_i, files, user["id"])
+    conn.commit()
+    conn.close()
+    return _with_flash(f"/inventory?edit={item_id_i}", "재고 품목이 등록되었습니다.", "ok")
+
+
+@app.post("/inventory/tx/{item_id}")
+def inventory_transaction(
+    request: Request,
+    item_id: int,
+    tx_type: str = Form(...),
+    quantity: str = Form(...),
+    reason: str = Form(""),
+):
+    user, error = _authorize(request, "inventory:transact")
+    if error:
+        return error
+
+    raw_qty = _parse_int(quantity, 0)
+    if raw_qty == 0 and tx_type != "조정":
+        return _with_flash(f"/inventory?edit={item_id}", "수량은 0이 될 수 없습니다.", "error")
+
+    if tx_type in {"반출", "사용"}:
+        delta = -abs(raw_qty)
+    elif tx_type in {"입고", "반납"}:
+        delta = abs(raw_qty)
+    else:
+        delta = raw_qty
+
+    conn = get_conn()
+    item = conn.execute("SELECT * FROM inventory_items WHERE id = ?", (item_id,)).fetchone()
+    if not item:
+        conn.close()
+        return _with_flash("/inventory", "재고 품목을 찾을 수 없습니다.", "error")
+
+    new_qty = int(item["quantity"] or 0) + delta
+    if new_qty < 0:
+        conn.close()
+        return _with_flash(f"/inventory?edit={item_id}", "재고가 음수가 될 수 없습니다.", "error")
+
+    derived_status = item["status"]
+    if derived_status in {"정상", "부족"}:
+        derived_status = "부족" if new_qty <= int(item["min_quantity"] or 0) else "정상"
+
+    conn.execute(
+        """
+        UPDATE inventory_items
+        SET quantity = ?, status = ?, updated_by = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (new_qty, derived_status, user["id"], _now_text(), item_id),
+    )
+    conn.execute(
+        """
+        INSERT INTO inventory_transactions(item_id, tx_type, quantity_delta, reason, actor_user_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (item_id, tx_type.strip(), delta, reason.strip(), user["id"], _now_text()),
+    )
+    conn.commit()
+    conn.close()
+    return _with_flash(f"/inventory?edit={item_id}", "수불 이력이 반영되었습니다.", "ok")
+
+
+@app.post("/inventory/delete/{item_id}")
+def inventory_delete(request: Request, item_id: int):
+    user, error = _authorize(request, "inventory:edit")
+    if error:
+        return error
+    conn = get_conn()
+    _delete_attachments(conn, "inventory", item_id)
+    conn.execute("DELETE FROM inventory_transactions WHERE item_id = ?", (item_id,))
+    conn.execute("DELETE FROM inventory_items WHERE id = ?", (item_id,))
+    conn.commit()
+    conn.close()
+    return _with_flash("/inventory", "재고 품목이 삭제되었습니다.", "ok")
+
+
+@app.get("/work-orders", response_class=HTMLResponse)
+def work_orders_page(request: Request):
+    user, error = _authorize(request, "work_orders:view")
+    if error:
+        return error
+
+    can_edit = auth.has_permission(user["role"], "work_orders:edit")
+    can_update = auth.has_permission(user["role"], "work_orders:update")
+    q = request.query_params.get("q", "").strip()
+    status = request.query_params.get("status", "").strip()
+    priority = request.query_params.get("priority", "").strip()
+    edit_id = _parse_int(request.query_params.get("edit", ""), 0)
+
+    conn = get_conn()
+    where = []
+    params: list = []
+    if q:
+        where.append("(w.work_code LIKE ? OR w.title LIKE ? OR w.description LIKE ? OR w.requester_name LIKE ?)")
+        params.extend([f"%{q}%"] * 4)
+    if status:
+        where.append("w.status = ?")
+        params.append(status)
+    if priority:
+        where.append("w.priority = ?")
+        params.append(priority)
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+
+    orders = conn.execute(
+        f"""
+        SELECT w.*, f.name AS facility_name, u.full_name AS assignee_name
+        FROM work_orders w
+        LEFT JOIN facilities f ON f.id = w.facility_id
+        LEFT JOIN users u ON u.id = w.assignee_user_id
+        {where_sql}
+        ORDER BY CASE w.priority WHEN '긴급' THEN 1 WHEN '높음' THEN 2 WHEN '보통' THEN 3 ELSE 4 END,
+                 w.updated_at DESC, w.id DESC
+        """,
+        params,
+    ).fetchall()
+    attachments = _attachment_map(conn, "work_order", [row["id"] for row in orders])
+    edit_row = conn.execute("SELECT * FROM work_orders WHERE id = ?", (edit_id,)).fetchone() if edit_id else None
+    updates = (
+        conn.execute(
+            """
+            SELECT u.*, us.full_name AS actor_name
+            FROM work_order_updates u
+            LEFT JOIN users us ON us.id = u.actor_user_id
+            WHERE u.work_order_id = ?
+            ORDER BY u.created_at DESC, u.id DESC
+            LIMIT 12
+            """,
+            (edit_id,),
+        ).fetchall()
+        if edit_id
+        else []
+    )
+    facility_options = _facility_options(conn)
+    assignee_options = _user_options(conn, include_viewers=False)
+    conn.close()
+
+    status_options = ["접수", "진행중", "대기", "보류", "완료", "종결"]
+    priority_options = ["낮음", "보통", "높음", "긴급"]
+    category_options = ["전기", "기계", "소방", "건축", "민원", "안전", "기타"]
+
+    form_html = ""
+    if can_edit:
+        form_html = (
+            "<section class='panel'><h2>작업지시 등록 / 수정</h2><p class='muted'>시설과 담당자를 기준으로 작업을 배정하고 추적합니다.</p>"
+            "<form action='/work-orders/save' method='post' enctype='multipart/form-data' class='stack'>"
+            f"<input type='hidden' name='work_order_id' value='{esc(edit_row['id'] if edit_row else '')}'>"
+            + (
+                f"<div><label>작업 번호</label><input value='{esc(edit_row['work_code'])}' disabled></div>"
+                if edit_row
+                else ""
+            )
+            + f"<div><label>분류</label><select name='category'>{render_options(category_options, edit_row['category'] if edit_row else '', blank_label='선택')}</select></div>"
+            + f"<div><label>작업 제목</label><input name='title' value='{esc(edit_row['title'] if edit_row else '')}' required></div>"
+            + f"<div><label>대상 시설</label><select name='facility_id'>{render_options(facility_options, str(edit_row['facility_id'] or '') if edit_row else '', blank_label='미지정')}</select></div>"
+            + "<div class='grid two'>"
+            + f"<div><label>요청자</label><input name='requester_name' value='{esc(edit_row['requester_name'] if edit_row else '')}'></div>"
+            + f"<div><label>담당자</label><select name='assignee_user_id'>{render_options(assignee_options, str(edit_row['assignee_user_id'] or '') if edit_row else '', blank_label='미지정')}</select></div>"
+            + "</div>"
+            + "<div class='grid two'>"
+            + f"<div><label>우선도</label><select name='priority'>{render_options(priority_options, edit_row['priority'] if edit_row else '보통')}</select></div>"
+            + f"<div><label>상태</label><select name='status'>{render_options(status_options, edit_row['status'] if edit_row else '접수')}</select></div>"
+            + "</div>"
+            + f"<div><label>기한</label><input name='due_date' type='date' value='{esc(fmt_date(edit_row['due_date']) if edit_row else '')}'></div>"
+            + f"<div><label>작업 내용</label><textarea name='description'>{esc(edit_row['description'] if edit_row else '')}</textarea></div>"
+            + "<div><label>현장 사진 / 첨부</label><input name='files' type='file' accept='image/*' multiple></div>"
+            + "<div class='row-actions'>"
+            + "<button class='btn primary' type='submit'>저장</button>"
+            + "<a class='btn secondary' href='/work-orders'>새로 입력</a>"
+            + (
+                f"<form action='/work-orders/delete/{edit_row['id']}' method='post' onsubmit=\"return confirm('작업지시를 삭제하시겠습니까?');\"><button class='btn danger' type='submit'>삭제</button></form>"
+                if edit_row
+                else ""
+            )
+            + "</div></form>"
+        )
+        if edit_row:
+            form_html += "<div style='margin-top:14px'><label>현재 첨부</label>" + attachment_gallery(attachments.get(edit_row["id"], [])) + "</div>"
+        if edit_row and can_update:
+            updates_html = (
+                "".join(
+                    """
+                    <tr>
+                      <td>{when}</td>
+                      <td>{type}</td>
+                      <td>{body}</td>
+                      <td>{actor}</td>
+                    </tr>
+                    """.format(
+                        when=esc(fmt_datetime(row["created_at"])),
+                        type=status_badge(row["update_type"]),
+                        body=esc(row["body"]),
+                        actor=esc(row["actor_name"] or "system"),
+                    )
+                    for row in updates
+                )
+                if updates
+                else "<tr><td colspan='4' class='muted'>업데이트 이력이 없습니다.</td></tr>"
+            )
+            form_html += (
+                "<div class='panel' style='margin-top:16px; padding:0; border:none; box-shadow:none;'>"
+                "<h3>진행 업데이트</h3><p class='muted'>상태 변경과 현장 코멘트를 남겨 보고서와 추적 이력에 바로 반영합니다.</p>"
+                f"<form action='/work-orders/update/{edit_row['id']}' method='post' enctype='multipart/form-data' class='stack'>"
+                "<div class='grid two'>"
+                f"<div><label>업데이트 유형</label><select name='update_type'>{render_options(['현장조치', '상태변경', '부품요청', '메모', '완료보고'], '현장조치')}</select></div>"
+                f"<div><label>새 상태</label><select name='status'>{render_options(status_options, edit_row['status'], blank_label='상태 유지')}</select></div>"
+                "</div>"
+                "<div><label>업데이트 내용</label><textarea name='body' required></textarea></div>"
+                "<div><label>추가 첨부</label><input name='files' type='file' accept='image/*' multiple></div>"
+                "<div class='row-actions'><button class='btn warn' type='submit'>업데이트 저장</button></div>"
+                "</form>"
+                "<div style='margin-top:14px'><h3>최근 업데이트</h3>"
+                "<table><thead><tr><th>시각</th><th>유형</th><th>내용</th><th>작성자</th></tr></thead>"
+                f"<tbody>{updates_html}</tbody></table></div></div>"
+            )
+        form_html += "</section>"
+    else:
+        form_html = info_box("읽기 전용", "현재 계정은 작업지시 조회만 가능합니다. 등록과 수정은 작업자 이상 권한이 필요합니다.")
+
+    if orders:
+        rows_html = []
+        for row in orders:
+            due_text = fmt_date(row["due_date"])
+            overdue = row["due_date"] and row["due_date"] < _today_text() and row["status"] not in {"완료", "종결"}
+            due_badge = status_badge("지연" if overdue else ("완료" if row["status"] in {"완료", "종결"} else "정상"))
+            actions = f"<a class='btn secondary' href='/work-orders?edit={row['id']}'>상세</a>" if (can_edit or can_update) else "<span class='muted'>조회</span>"
+            rows_html.append(
+                """
+                <tr>
+                  <td>{code}</td>
+                  <td><strong>{title}</strong><div class='muted'>{category}</div><div class='muted'>{description}</div></td>
+                  <td>{facility}</td>
+                  <td>{priority}<div style='margin-top:6px'>{status}</div></td>
+                  <td>{assignee}<div class='muted'>기한 {due}</div><div style='margin-top:6px'>{due_badge}</div></td>
+                  <td>{attachments}</td>
+                  <td>{actions}</td>
+                </tr>
+                """.format(
+                    code=esc(row["work_code"]),
+                    title=esc(row["title"]),
+                    category=esc(row["category"] or "-"),
+                    description=esc((row["description"] or "")[:80] + ("..." if len(row["description"] or "") > 80 else "")),
+                    facility=esc(row["facility_name"] or "시설 미지정"),
+                    priority=status_badge(row["priority"]),
+                    status=status_badge(row["status"]),
+                    assignee=esc(row["assignee_name"] or "미배정"),
+                    due=esc(due_text),
+                    due_badge=due_badge,
+                    attachments=attachment_gallery(attachments.get(row["id"], [])),
+                    actions=actions,
+                )
+            )
+        list_html = (
+            "<section class='panel'><div class='split'><div><h2>작업지시 목록</h2><p class='muted'>우선도와 상태를 기준으로 지연 작업을 우선 확인합니다.</p></div>"
+            "<form class='inline-form' method='get' action='/work-orders'>"
+            f"<input name='q' value='{esc(q)}' placeholder='번호, 제목, 내용, 요청자 검색'>"
+            f"<select name='status'>{render_options(status_options, status, blank_label='전체 상태')}</select>"
+            f"<select name='priority'>{render_options(priority_options, priority, blank_label='전체 우선도')}</select>"
+            "<button class='btn secondary' type='submit'>검색</button>"
+            "</form></div>"
+            "<table><thead><tr><th>번호</th><th>작업</th><th>시설</th><th>우선도/상태</th><th>담당/기한</th><th>첨부</th><th>관리</th></tr></thead>"
+            f"<tbody>{''.join(rows_html)}</tbody></table></section>"
+        )
+    else:
+        list_html = "<section class='panel'><h2>작업지시 목록</h2>" + empty_state("조건에 맞는 작업지시가 없습니다.") + "</section>"
+
+    flash_message, flash_level = _flash_from_request(request)
+    body = (
+        page_header(
+            "Work Orders",
+            "작업지시 관리",
+            "작업 요청, 배정, 진행 업데이트, 완료 기록을 한 엔티티로 관리합니다.",
+        )
+        + "<div class='layout-2'>"
+        + form_html
+        + list_html
+        + "</div>"
+    )
+    return HTMLResponse(layout(title="작업지시 관리", body=body, user=user, flash_message=flash_message, flash_level=flash_level))
+
+
+@app.post("/work-orders/save")
+def work_orders_save(
+    request: Request,
+    work_order_id: str = Form(""),
+    category: str = Form(""),
+    title: str = Form(...),
+    facility_id: str = Form(""),
+    requester_name: str = Form(""),
+    priority: str = Form("보통"),
+    status: str = Form("접수"),
+    description: str = Form(""),
+    assignee_user_id: str = Form(""),
+    due_date: str = Form(""),
+    files: List[UploadFile] = File(default=[]),
+):
+    user, error = _authorize(request, "work_orders:edit")
+    if error:
+        return error
+
+    work_order_id_i = _parse_int(work_order_id, 0)
+    facility_id_i = _parse_int(facility_id, 0) or None
+    assignee_id_i = _parse_int(assignee_user_id, 0) or None
+    completed_at = _now_text() if status in {"완료", "종결"} else ""
+
+    conn = get_conn()
+    if work_order_id_i:
+        conn.execute(
+            """
+            UPDATE work_orders
+            SET category = ?, title = ?, facility_id = ?, requester_name = ?, priority = ?, status = ?, description = ?,
+                assignee_user_id = ?, due_date = ?, completed_at = ?, updated_by = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                category.strip(),
+                title.strip(),
+                facility_id_i,
+                requester_name.strip(),
+                priority.strip(),
+                status.strip(),
+                description.strip(),
+                assignee_id_i,
+                due_date.strip(),
+                completed_at,
+                user["id"],
+                _now_text(),
+                work_order_id_i,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO work_order_updates(work_order_id, update_type, body, actor_user_id, created_at)
+            VALUES (?, '기본정보수정', ?, ?, ?)
+            """,
+            (work_order_id_i, "작업지시 기본정보 수정", user["id"], _now_text()),
+        )
+        _save_attachments(conn, "work_order", work_order_id_i, files, user["id"])
+        conn.commit()
+        conn.close()
+        return _with_flash(f"/work-orders?edit={work_order_id_i}", "작업지시가 수정되었습니다.", "ok")
+
+    cursor = conn.execute(
+        """
+        INSERT INTO work_orders(
+            work_code, category, title, facility_id, requester_name, priority, status, description,
+            assignee_user_id, due_date, completed_at, created_by, updated_by, created_at, updated_at
+        )
+        VALUES ('', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            category.strip(),
+            title.strip(),
+            facility_id_i,
+            requester_name.strip(),
+            priority.strip(),
+            status.strip(),
+            description.strip(),
+            assignee_id_i,
+            due_date.strip(),
+            completed_at,
+            user["id"],
+            user["id"],
+            _now_text(),
+            _now_text(),
+        ),
+    )
+    work_order_id_i = cursor.lastrowid
+    conn.execute("UPDATE work_orders SET work_code = ? WHERE id = ?", (f"WO-{work_order_id_i:04d}", work_order_id_i))
+    conn.execute(
+        """
+        INSERT INTO work_order_updates(work_order_id, update_type, body, actor_user_id, created_at)
+        VALUES (?, '생성', ?, ?, ?)
+        """,
+        (work_order_id_i, "작업지시가 생성되었습니다.", user["id"], _now_text()),
+    )
+    _save_attachments(conn, "work_order", work_order_id_i, files, user["id"])
+    conn.commit()
+    conn.close()
+    return _with_flash(f"/work-orders?edit={work_order_id_i}", "작업지시가 등록되었습니다.", "ok")
+
+
+@app.post("/work-orders/update/{work_order_id}")
+def work_orders_update(
+    request: Request,
+    work_order_id: int,
+    update_type: str = Form(...),
+    body: str = Form(...),
+    status: str = Form(""),
+    files: List[UploadFile] = File(default=[]),
+):
+    user, error = _authorize(request, "work_orders:update")
+    if error:
+        return error
+
+    conn = get_conn()
+    order = conn.execute("SELECT * FROM work_orders WHERE id = ?", (work_order_id,)).fetchone()
+    if not order:
+        conn.close()
+        return _with_flash("/work-orders", "작업지시를 찾을 수 없습니다.", "error")
+
+    new_status = status.strip() or order["status"]
+    completed_at = order["completed_at"]
+    if new_status in {"완료", "종결"} and not completed_at:
+        completed_at = _now_text()
+    elif new_status not in {"완료", "종결"}:
+        completed_at = ""
+
+    conn.execute(
+        """
+        UPDATE work_orders
+        SET status = ?, completed_at = ?, updated_by = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (new_status, completed_at, user["id"], _now_text(), work_order_id),
+    )
+    conn.execute(
+        """
+        INSERT INTO work_order_updates(work_order_id, update_type, body, actor_user_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (work_order_id, update_type.strip(), body.strip(), user["id"], _now_text()),
+    )
+    _save_attachments(conn, "work_order", work_order_id, files, user["id"])
+    conn.commit()
+    conn.close()
+    return _with_flash(f"/work-orders?edit={work_order_id}", "작업 업데이트가 저장되었습니다.", "ok")
+
+
+@app.post("/work-orders/delete/{work_order_id}")
+def work_orders_delete(request: Request, work_order_id: int):
+    user, error = _authorize(request, "work_orders:edit")
+    if error:
+        return error
+    conn = get_conn()
+    _delete_attachments(conn, "work_order", work_order_id)
+    conn.execute("DELETE FROM work_order_updates WHERE work_order_id = ?", (work_order_id,))
+    conn.execute("DELETE FROM work_orders WHERE id = ?", (work_order_id,))
+    conn.commit()
+    conn.close()
+    return _with_flash("/work-orders", "작업지시가 삭제되었습니다.", "ok")
+
+
+@app.get("/reports", response_class=HTMLResponse)
+def reports_page(request: Request):
+    user, error = _authorize(request, "reports:view")
+    if error:
+        return error
+
+    start = request.query_params.get("start", _month_start_text())
+    end = request.query_params.get("end", _today_text())
+    conn = get_conn()
+    created_work = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM work_orders
+        WHERE substr(created_at, 1, 10) BETWEEN ? AND ?
+        """,
+        (start, end),
+    ).fetchone()["count"]
+    completed_work = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM work_orders
+        WHERE completed_at != ''
+          AND substr(completed_at, 1, 10) BETWEEN ? AND ?
+        """,
+        (start, end),
+    ).fetchone()["count"]
+    open_work = conn.execute(
+        "SELECT COUNT(*) AS count FROM work_orders WHERE status NOT IN ('완료', '종결')"
+    ).fetchone()["count"]
+    overdue_work = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM work_orders
+        WHERE due_date != ''
+          AND due_date < ?
+          AND status NOT IN ('완료', '종결')
+        """,
+        (_today_text(),),
+    ).fetchone()["count"]
+    low_stock_rows = conn.execute(
+        """
+        SELECT item_code, name, quantity, min_quantity, unit, location
+        FROM inventory_items
+        WHERE quantity <= min_quantity
+        ORDER BY quantity ASC, min_quantity DESC, name ASC
+        LIMIT 10
+        """
+    ).fetchall()
+    facility_status_rows = conn.execute(
+        """
+        SELECT status, COUNT(*) AS count
+        FROM facilities
+        GROUP BY status
+        ORDER BY count DESC, status ASC
+        """
+    ).fetchall()
+    high_priority_rows = conn.execute(
+        """
+        SELECT work_code, title, priority, status, due_date
+        FROM work_orders
+        WHERE priority IN ('긴급', '높음')
+          AND status NOT IN ('완료', '종결')
+        ORDER BY CASE priority WHEN '긴급' THEN 1 ELSE 2 END, due_date ASC, updated_at DESC
+        LIMIT 10
+        """
+    ).fetchall()
+    recent_updates = conn.execute(
+        """
+        SELECT u.created_at, u.update_type, u.body, w.work_code, w.title
+        FROM work_order_updates u
+        JOIN work_orders w ON w.id = u.work_order_id
+        WHERE substr(u.created_at, 1, 10) BETWEEN ? AND ?
+        ORDER BY u.created_at DESC, u.id DESC
+        LIMIT 8
+        """,
+        (start, end),
+    ).fetchall()
+    tx_count = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM inventory_transactions
+        WHERE substr(created_at, 1, 10) BETWEEN ? AND ?
+        """,
+        (start, end),
+    ).fetchone()["count"]
+    conn.close()
+
+    report_lines = [
+        "[시설 운영 요약 보고서]",
+        f"기간: {start} ~ {end}",
+        "",
+        "1. 작업지시 현황",
+        f"- 신규 등록: {created_work}건",
+        f"- 완료 처리: {completed_work}건",
+        f"- 현재 미완료: {open_work}건",
+        f"- 지연 작업: {overdue_work}건",
+        "",
+        "2. 재고 운영",
+        f"- 기간 중 수불 처리: {tx_count}건",
+        f"- 부족 재고 경고: {len(low_stock_rows)}건",
+    ]
+    if low_stock_rows:
+        for row in low_stock_rows[:5]:
+            report_lines.append(
+                f"  · {row['item_code']} {row['name']} / {row['quantity']}{row['unit']} / 최소 {row['min_quantity']}{row['unit']} / {row['location']}"
+            )
+    else:
+        report_lines.append("  · 부족 재고 없음")
+
+    report_lines.extend(["", "3. 우선 조치 대상"])
+    if high_priority_rows:
+        for row in high_priority_rows[:5]:
+            report_lines.append(
+                f"  · {row['work_code']} {row['title']} / {row['priority']} / {row['status']} / 기한 {fmt_date(row['due_date'])}"
+            )
+    else:
+        report_lines.append("  · 긴급/높음 미완료 작업 없음")
+
+    report_lines.extend(["", "4. 시설 상태"])
+    if facility_status_rows:
+        for row in facility_status_rows:
+            report_lines.append(f"  · {row['status']}: {row['count']}개")
+    else:
+        report_lines.append("  · 시설 데이터 없음")
+
+    metrics = (
+        "<section class='metrics'>"
+        + metric_card("신규 작업", created_work, f"{start}~{end}")
+        + metric_card("완료 작업", completed_work, f"현재 미완료 {open_work}건")
+        + metric_card("지연 작업", overdue_work, "기한 초과 기준")
+        + metric_card("재고 변동", tx_count, f"부족 경고 {len(low_stock_rows)}건")
+        + "</section>"
+    )
+
+    low_stock_html = (
+        "<table><thead><tr><th>품목</th><th>수량</th><th>최소 수량</th><th>위치</th></tr></thead><tbody>"
+        + (
+            "".join(
+                """
+                <tr>
+                  <td><strong>{code}</strong><div class='muted'>{name}</div></td>
+                  <td>{qty}</td>
+                  <td>{min_qty}</td>
+                  <td>{location}</td>
+                </tr>
+                """.format(
+                    code=esc(row["item_code"]),
+                    name=esc(row["name"]),
+                    qty=esc(f"{row['quantity']}{row['unit']}"),
+                    min_qty=esc(f"{row['min_quantity']}{row['unit']}"),
+                    location=esc(row["location"] or "-"),
+                )
+                for row in low_stock_rows
+            )
+            if low_stock_rows
+            else "<tr><td colspan='4' class='muted'>부족 재고가 없습니다.</td></tr>"
+        )
+        + "</tbody></table>"
+    )
+
+    high_priority_html = (
+        "<table><thead><tr><th>번호</th><th>작업</th><th>우선도</th><th>상태</th><th>기한</th></tr></thead><tbody>"
+        + (
+            "".join(
+                """
+                <tr>
+                  <td>{code}</td>
+                  <td>{title}</td>
+                  <td>{priority}</td>
+                  <td>{status}</td>
+                  <td>{due}</td>
+                </tr>
+                """.format(
+                    code=esc(row["work_code"]),
+                    title=esc(row["title"]),
+                    priority=status_badge(row["priority"]),
+                    status=status_badge(row["status"]),
+                    due=esc(fmt_date(row["due_date"])),
+                )
+                for row in high_priority_rows
+            )
+            if high_priority_rows
+            else "<tr><td colspan='5' class='muted'>우선 조치 대상이 없습니다.</td></tr>"
+        )
+        + "</tbody></table>"
+    )
+
+    updates_html = (
+        "<table><thead><tr><th>시각</th><th>작업</th><th>유형</th><th>내용</th></tr></thead><tbody>"
+        + (
+            "".join(
+                """
+                <tr>
+                  <td>{when}</td>
+                  <td><strong>{code}</strong><div class='muted'>{title}</div></td>
+                  <td>{type}</td>
+                  <td>{body}</td>
+                </tr>
+                """.format(
+                    when=esc(fmt_datetime(row["created_at"])),
+                    code=esc(row["work_code"]),
+                    title=esc(row["title"]),
+                    type=status_badge(row["update_type"]),
+                    body=esc(row["body"]),
+                )
+                for row in recent_updates
+            )
+            if recent_updates
+            else "<tr><td colspan='4' class='muted'>기간 내 업데이트가 없습니다.</td></tr>"
+        )
+        + "</tbody></table>"
+    )
+
+    flash_message, flash_level = _flash_from_request(request)
+    body = (
+        page_header(
+            "Reporting",
+            "운영 보고서",
+            "작업, 재고, 시설 상태를 같은 기간 축으로 묶어 현황 보고에 바로 사용할 수 있는 초안을 생성합니다.",
+            actions=("<button class='btn secondary' type='button' onclick='window.print()'>화면 인쇄</button>"),
+        )
+        + "<section class='panel'><div class='split'><h2>보고 기간 설정</h2>"
+        + "<form class='inline-form' method='get' action='/reports'>"
+        + f"<div><label>시작일</label><input name='start' type='date' value='{esc(start)}'></div>"
+        + f"<div><label>종료일</label><input name='end' type='date' value='{esc(end)}'></div>"
+        + "<div><label>&nbsp;</label><button class='btn primary' type='submit'>보고서 갱신</button></div>"
+        + "</form></div></section>"
+        + metrics
+        + "<div class='layout-2'>"
+        + "<div class='stack'>"
+        + "<section class='panel'><h2>자동 생성 보고문</h2><div class='report-box'>"
+        + esc("\n".join(report_lines))
+        + "</div></section>"
+        + "<section class='panel'><h2>부족 재고</h2>"
+        + low_stock_html
+        + "</section></div>"
+        + "<div class='stack'>"
+        + "<section class='panel'><h2>우선 조치 대상</h2>"
+        + high_priority_html
+        + "</section>"
+        + "<section class='panel'><h2>기간 내 주요 업데이트</h2>"
+        + updates_html
+        + "</section></div></div>"
+    )
+    return HTMLResponse(layout(title="운영 보고서", body=body, user=user, flash_message=flash_message, flash_level=flash_level))
+
+
+@app.get("/admin/users", response_class=HTMLResponse)
+def users_page(request: Request):
+    user, error = _authorize(request, "users:manage")
+    if error:
+        return error
+
+    edit_id = _parse_int(request.query_params.get("edit", ""), 0)
+    conn = get_conn()
+    users = conn.execute(
+        "SELECT * FROM users ORDER BY is_active DESC, role ASC, full_name ASC, id ASC"
+    ).fetchall()
+    edit_row = conn.execute("SELECT * FROM users WHERE id = ?", (edit_id,)).fetchone() if edit_id else None
+    conn.close()
+
+    form_html = (
+        "<section class='panel'><h2>사용자 등록 / 수정</h2><p class='muted'>역할 기반 권한을 부여해 9명 공동 운영을 지원합니다.</p>"
+        "<form action='/admin/users/save' method='post' class='stack'>"
+        f"<input type='hidden' name='user_id' value='{esc(edit_row['id'] if edit_row else '')}'>"
+        + f"<div><label>아이디</label><input name='username' value='{esc(edit_row['username'] if edit_row else '')}' required></div>"
+        + f"<div><label>이름</label><input name='full_name' value='{esc(edit_row['full_name'] if edit_row else '')}' required></div>"
+        + f"<div><label>역할</label><select name='role'>{render_options(auth.role_options(), edit_row['role'] if edit_row else 'viewer')}</select></div>"
+        + f"<div><label>비밀번호{' (변경 시에만 입력)' if edit_row else ''}</label><input name='password' type='password' {'placeholder=\"변경하지 않으려면 비워두기\"' if edit_row else 'required'}></div>"
+        + (
+            f"<label style='display:flex;align-items:center;gap:8px;'><input name='is_active' type='checkbox' value='1' {'checked' if edit_row['is_active'] else ''} style='width:auto;'>활성 사용자</label>"
+            if edit_row
+            else "<label style='display:flex;align-items:center;gap:8px;'><input name='is_active' type='checkbox' value='1' checked style='width:auto;'>활성 사용자</label>"
+        )
+        + "<div class='row-actions'><button class='btn primary' type='submit'>저장</button><a class='btn secondary' href='/admin/users'>새로 입력</a></div>"
+        + "</form></section>"
+    )
+
+    if users:
+        rows_html = []
+        for row in users:
+            rows_html.append(
+                """
+                <tr>
+                  <td>{username}</td>
+                  <td>{name}</td>
+                  <td>{role}</td>
+                  <td>{status}</td>
+                  <td>{created}</td>
+                  <td>{actions}</td>
+                </tr>
+                """.format(
+                    username=esc(row["username"]),
+                    name=esc(row["full_name"]),
+                    role=esc(auth.ROLE_LABELS.get(row["role"], row["role"])),
+                    status=status_badge("활성" if row["is_active"] else "비활성"),
+                    created=esc(fmt_datetime(row["created_at"])),
+                    actions=f"<a class='btn secondary' href='/admin/users?edit={row['id']}'>수정</a>",
+                )
+            )
+        list_html = (
+            "<section class='panel'><h2>사용자 목록</h2><table>"
+            "<thead><tr><th>아이디</th><th>이름</th><th>역할</th><th>상태</th><th>등록일</th><th>관리</th></tr></thead>"
+            f"<tbody>{''.join(rows_html)}</tbody></table></section>"
+        )
+    else:
+        list_html = "<section class='panel'><h2>사용자 목록</h2>" + empty_state("등록된 사용자가 없습니다.") + "</section>"
+
+    flash_message, flash_level = _flash_from_request(request)
+    body = (
+        page_header(
+            "Access Governance",
+            "권한 관리",
+            "계정별 역할을 부여해 수정 권한과 조회 권한을 분리합니다.",
+        )
+        + "<div class='layout-2'>"
+        + form_html
+        + list_html
+        + "</div>"
+    )
+    return HTMLResponse(layout(title="권한 관리", body=body, user=user, flash_message=flash_message, flash_level=flash_level))
+
+
+@app.post("/admin/users/save")
+def users_save(
+    request: Request,
+    user_id: str = Form(""),
+    username: str = Form(...),
+    full_name: str = Form(...),
+    role: str = Form(...),
+    password: str = Form(""),
+    is_active: str = Form(""),
+):
+    current_user, error = _authorize(request, "users:manage")
+    if error:
+        return error
+
+    if not auth.valid_role(role):
+        return _with_flash("/admin/users", "유효하지 않은 역할입니다.", "error")
+
+    user_id_i = _parse_int(user_id, 0)
+    active_value = 1 if _bool_from_form(is_active) else 0
+    conn = get_conn()
+    try:
+        if user_id_i:
+            target = conn.execute("SELECT * FROM users WHERE id = ?", (user_id_i,)).fetchone()
+            if not target:
+                conn.close()
+                return _with_flash("/admin/users", "사용자를 찾을 수 없습니다.", "error")
+            if target["id"] == current_user["id"] and not active_value:
+                conn.close()
+                return _with_flash(f"/admin/users?edit={user_id_i}", "현재 로그인한 계정은 비활성화할 수 없습니다.", "error")
+
+            if password.strip():
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET username = ?, full_name = ?, role = ?, password_hash = ?, is_active = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        username.strip(),
+                        full_name.strip(),
+                        role,
+                        auth.hash_password(password.strip()),
+                        active_value,
+                        _now_text(),
+                        user_id_i,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET username = ?, full_name = ?, role = ?, is_active = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        username.strip(),
+                        full_name.strip(),
+                        role,
+                        active_value,
+                        _now_text(),
+                        user_id_i,
+                    ),
+                )
+            conn.commit()
+            conn.close()
+            return _with_flash(f"/admin/users?edit={user_id_i}", "사용자 정보가 수정되었습니다.", "ok")
+
+        if not password.strip():
+            conn.close()
+            return _with_flash("/admin/users", "신규 사용자는 비밀번호가 필요합니다.", "error")
+        conn.execute(
+            """
+            INSERT INTO users(username, full_name, role, password_hash, is_active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                username.strip(),
+                full_name.strip(),
+                role,
+                auth.hash_password(password.strip()),
+                active_value,
+                _now_text(),
+                _now_text(),
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return _with_flash("/admin/users", "사용자가 등록되었습니다.", "ok")
+    except Exception as exc:
+        conn.close()
+        return _with_flash("/admin/users", f"사용자 저장에 실패했습니다: {exc}", "error")
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "service": "facility-operations"}
