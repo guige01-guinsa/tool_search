@@ -2,4 +2,3 @@ fastapi
 uvicorn
 pillow
 python-multipart
-reportlab
