@@ -92,6 +92,26 @@ pip install -r requirements.txt
 PORT=8000 ./start.sh
 ```
 
+## Render 배포
+
+이 저장소에는 `render.yaml`이 포함되어 있어 새 Render Web Service를 같은 설정으로 다시 만들 수 있다.
+
+권장 환경변수:
+
+- `OPS_ADMIN_USERNAME=admin`
+- `OPS_ADMIN_PASSWORD=<강한 비밀번호>`
+- `OPS_ADMIN_NAME=시스템 관리자`
+- `OPS_COOKIE_SECURE=true`
+- `OPS_DB_PATH=/opt/render/project/src/data/operations.db`
+- `OPS_UPLOAD_DIR=/opt/render/project/src/data/uploads`
+
+주의:
+
+- Render Free 플랜에서 자동배포가 `pipeline_minutes_exhausted`로 실패하면 빌드 가능 시간이 소진된 상태다.
+- 이 경우 저장소 설정과 코드가 정상이어도 새 배포는 진행되지 않는다.
+- 빌드 분량이 초기화되거나 상위 플랜으로 전환된 뒤 다시 수동 배포해야 한다.
+- 현재 경로 설정은 동작 중심이며, 장기 운영용 영속 저장소가 필요하면 Render 디스크 또는 외부 스토리지를 별도로 붙여야 한다.
+
 ## 데이터 파일
 
 운영 시스템의 실제 저장 대상은 다음 두 가지다.

@@ -40,6 +40,7 @@
 - 신규 DB: `operations.db`
 - 첨부 파일: 기존 `uploads/` 폴더 재사용
 - 레거시 DB 이관: 필요할 때만 `LEGACY_DB_PATH` 환경변수로 지정
+- 배포 환경에서는 `OPS_DB_PATH`, `OPS_UPLOAD_DIR`, `OPS_ADMIN_PASSWORD`, `OPS_COOKIE_SECURE` 환경변수로 운영값을 주입
 
 ## 핵심 데이터 모델
 

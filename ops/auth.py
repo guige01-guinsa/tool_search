@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import secrets
 from datetime import datetime, timedelta
 
@@ -60,9 +61,21 @@ ROLE_PERMISSIONS = {
     },
 }
 
-DEFAULT_ADMIN_USERNAME = "admin"
-DEFAULT_ADMIN_PASSWORD = "admin1234"
-DEFAULT_ADMIN_NAME = "시스템 관리자"
+FALLBACK_ADMIN_USERNAME = "admin"
+FALLBACK_ADMIN_PASSWORD = "admin1234"
+FALLBACK_ADMIN_NAME = "시스템 관리자"
+
+_ENV_ADMIN_USERNAME = os.getenv("OPS_ADMIN_USERNAME", "").strip()
+_ENV_ADMIN_PASSWORD = os.getenv("OPS_ADMIN_PASSWORD", "")
+_ENV_ADMIN_NAME = os.getenv("OPS_ADMIN_NAME", "").strip()
+
+DEFAULT_ADMIN_USERNAME = _ENV_ADMIN_USERNAME or FALLBACK_ADMIN_USERNAME
+DEFAULT_ADMIN_PASSWORD = _ENV_ADMIN_PASSWORD or FALLBACK_ADMIN_PASSWORD
+DEFAULT_ADMIN_NAME = _ENV_ADMIN_NAME or FALLBACK_ADMIN_NAME
+
+
+def should_show_bootstrap_password() -> bool:
+    return not bool(_ENV_ADMIN_PASSWORD)
 
 
 def role_options() -> list[tuple[str, str]]:

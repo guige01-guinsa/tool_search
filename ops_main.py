@@ -28,8 +28,9 @@ from ops.ui import (
 )
 
 BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_DIR = BASE_DIR / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR = Path(os.getenv("OPS_UPLOAD_DIR", str(BASE_DIR / "uploads")))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+COOKIE_SECURE = str(os.getenv("OPS_COOKIE_SECURE", "")).strip().lower() in {"1", "true", "on", "yes"}
 
 app = FastAPI(title="시설 운영 시스템")
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
@@ -83,6 +84,18 @@ def _with_flash(path: str, message: str = "", level: str = "info") -> RedirectRe
 
 def _flash_from_request(request: Request) -> tuple[str, str]:
     return request.query_params.get("msg", ""), request.query_params.get("level", "info")
+
+
+def _admin_bootstrap_message() -> str:
+    if auth.should_show_bootstrap_password():
+        return (
+            f"최초 관리자 계정은 {auth.DEFAULT_ADMIN_USERNAME} / {auth.DEFAULT_ADMIN_PASSWORD} 입니다. "
+            "접속 후 즉시 비밀번호를 변경해 주세요."
+        )
+    return (
+        f"최초 관리자 계정은 {auth.DEFAULT_ADMIN_USERNAME} 입니다. "
+        "초기 비밀번호는 배포 환경변수 `OPS_ADMIN_PASSWORD` 값으로 설정됩니다."
+    )
 
 
 def _authorize(request: Request, permission: str | None = None):
@@ -209,12 +222,20 @@ def login_page(request: Request):
     conn.close()
     hint = ""
     if user_count == 1:
-        hint = (
-            "<div class='pill-row'>"
-            f"<span class='pill'>초기 관리자: {esc(auth.DEFAULT_ADMIN_USERNAME)}</span>"
-            f"<span class='pill'>초기 비밀번호: {esc(auth.DEFAULT_ADMIN_PASSWORD)}</span>"
-            "</div>"
-        )
+        if auth.should_show_bootstrap_password():
+            hint = (
+                "<div class='pill-row'>"
+                f"<span class='pill'>초기 관리자: {esc(auth.DEFAULT_ADMIN_USERNAME)}</span>"
+                f"<span class='pill'>초기 비밀번호: {esc(auth.DEFAULT_ADMIN_PASSWORD)}</span>"
+                "</div>"
+            )
+        else:
+            hint = (
+                "<div class='pill-row'>"
+                f"<span class='pill'>초기 관리자: {esc(auth.DEFAULT_ADMIN_USERNAME)}</span>"
+                "<span class='pill'>초기 비밀번호: Render 환경변수 사용</span>"
+                "</div>"
+            )
 
     body = (
         page_header(
@@ -259,6 +280,7 @@ def login_submit(username: str = Form(...), password: str = Form(...)):
         auth.SESSION_COOKIE,
         token,
         httponly=True,
+        secure=COOKIE_SECURE,
         samesite="lax",
         max_age=7 * 24 * 60 * 60,
     )
@@ -422,7 +444,7 @@ def dashboard(request: Request):
         )
         + info_box(
             "초기 계정",
-            f"최초 관리자 계정은 {auth.DEFAULT_ADMIN_USERNAME} / {auth.DEFAULT_ADMIN_PASSWORD} 입니다. 접속 후 즉시 비밀번호를 변경해 주세요.",
+            _admin_bootstrap_message(),
         )
         + "</div>"
         + "<div class='stack'>"

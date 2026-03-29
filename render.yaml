@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: tool-search
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash start.sh
+    healthCheckPath: /healthz
+    envVars:
+      - key: OPS_DB_PATH
+        value: /opt/render/project/src/data/operations.db
+      - key: OPS_UPLOAD_DIR
+        value: /opt/render/project/src/data/uploads
+      - key: OPS_COOKIE_SECURE
+        value: "true"
+      - key: OPS_ADMIN_USERNAME
+        value: admin
+      - key: OPS_ADMIN_NAME
+        value: 시스템 관리자
+      - key: OPS_ADMIN_PASSWORD
+        sync: false
