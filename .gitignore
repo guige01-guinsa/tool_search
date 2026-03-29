@@ -7,3 +7,6 @@ tools.db
 operations.db
 logs/
 git_token/
+build/
+dist/
+runtime_data/

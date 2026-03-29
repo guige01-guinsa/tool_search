@@ -47,6 +47,13 @@ uvicorn ops_main:app --host 0.0.0.0 --port $env:PORT
 - 홈 화면에 추가한 뒤에는 전체화면 앱처럼 실행되고, 같은 네트워크의 서버 주소로 접속한다.
 - `http://127.0.0.1` 같은 로컬 PC에서는 바로 동작하지만, 스마트폰 등 다른 기기에서 설치형 PWA로 쓰려면 보통 `HTTPS` 주소가 필요하다.
 
+## 로컬 HTTPS
+
+- 인증서 생성: `powershell -ExecutionPolicy Bypass -File .\scripts\setup_local_https.ps1`
+- exe 실행: `FacilityOpsServer.exe` 또는 개발 실행: `python .\ops_launcher.py`
+- 인증서가 `runtime_data\certs\local-network-cert.pem` / `local-network-key.pem`에 있으면 런처가 자동으로 `https://<PC-IP>:8443` 로 실행한다.
+- Android 스마트폰은 `runtime_data\certs\rootCA.crt` 또는 `rootCA.pem` 설치 후 인증서를 신뢰해야 하고, iPhone/iPad는 프로파일 설치 후 `설정 > 일반 > 정보 > 인증서 신뢰 설정`에서 전체 신뢰를 켜야 한다.
+
 ## DB 관리
 
 - 관리자 로그인 후 상단 `DB관리` 메뉴에서만 모든 운영 테이블을 raw DB 수준으로 조회·등록·수정·삭제 가능
