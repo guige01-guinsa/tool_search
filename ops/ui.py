@@ -125,6 +125,8 @@ def nav_for_user(user) -> str:
     )
     if has_permission(user["role"], "users:manage"):
         links.append(("/admin/users", "권한관리", "users:manage"))
+    if has_permission(user["role"], "db:raw:view"):
+        links.append(("/admin/database", "DB관리", "db:raw:view"))
 
     items = []
     for href, label, permission in links:

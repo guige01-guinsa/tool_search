@@ -10,6 +10,7 @@
 - 작업지시 및 진행 업데이트
 - 운영 보고서
 - 사용자/권한 관리
+- 관리자용 DB관리 화면
 - 회원가입 승인 흐름
 - 아이디 찾기 / 비밀번호 재설정
 
@@ -38,6 +39,18 @@ uvicorn ops_main:app --host 0.0.0.0 --port $env:PORT
 - `회원가입`: 기본 `조회전용 + 비활성`으로 생성되고, 관리자가 승인 후 사용
 - `아이디 찾기`: 이름, 연락처, 복구 질문/답변이 일치할 때 아이디 일부 표시
 - `비밀번호 재설정`: 아이디, 이름, 연락처, 복구 질문/답변이 일치할 때 새 비밀번호로 변경
+
+## DB 관리
+
+- 관리자 로그인 후 상단 `DB관리` 메뉴에서만 모든 운영 테이블을 raw DB 수준으로 조회·등록·수정·삭제 가능
+- 대상 테이블: `users`, `sessions`, `facilities`, `inventory_items`, `inventory_transactions`, `work_orders`, `work_order_updates`, `attachments`
+
+## 권한 분리
+
+- `admin`: 사용자 관리, raw DB 관리, 전체 업무 데이터 관리
+- `manager`: 시설/재고/작업지시 전체 관리, raw DB 직접 접근 불가
+- `technician`: 재고 수불 처리, 작업지시 등록, 본인 생성 또는 본인 배정 작업지시 업데이트
+- `viewer`: 조회 전용
 
 ## Render 배포
 

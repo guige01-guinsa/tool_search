@@ -343,6 +343,182 @@ def _user_options(conn, *, include_viewers: bool = True) -> list[tuple[str, str]
     return [(str(row["id"]), f"{row['full_name']} ({auth.ROLE_LABELS.get(row['role'], row['role'])})") for row in rows]
 
 
+DB_TABLE_LABELS = {
+    "users": "사용자",
+    "sessions": "세션",
+    "facilities": "시설",
+    "inventory_items": "재고 항목",
+    "inventory_transactions": "재고 수불 이력",
+    "work_orders": "작업지시",
+    "work_order_updates": "작업 업데이트",
+    "attachments": "첨부파일",
+}
+DB_MANAGED_TABLES = list(DB_TABLE_LABELS.keys())
+DB_TEXTAREA_COLUMNS = {"note", "body", "description", "reason", "specification"}
+_DB_OMIT = object()
+
+
+def _db_safe_table(table: str) -> str:
+    return table if table in DB_TABLE_LABELS else DB_MANAGED_TABLES[0]
+
+
+def _db_columns(conn, table: str):
+    return conn.execute(f"PRAGMA table_info({_db_safe_table(table)})").fetchall()
+
+
+def _db_default_text(default_value) -> str:
+    if default_value is None:
+        return ""
+    text = str(default_value)
+    if len(text) >= 2 and text[0] == "'" and text[-1] == "'":
+        return text[1:-1]
+    return text
+
+
+def _db_convert_value(column, raw_value, *, for_create: bool):
+    value = "" if raw_value is None else str(raw_value)
+    col_type = (column["type"] or "").upper()
+    default_value = column["dflt_value"]
+
+    if value == "":
+        if for_create and default_value is not None:
+            return _DB_OMIT
+        if "INT" in col_type:
+            if column["notnull"]:
+                raise ValueError(f"{column['name']} 값이 필요합니다.")
+            return None
+        if column["notnull"] and default_value is None:
+            raise ValueError(f"{column['name']} 값이 필요합니다.")
+        if not column["notnull"]:
+            return None
+        return ""
+
+    if "INT" in col_type:
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise ValueError(f"{column['name']} 는 숫자여야 합니다.") from exc
+    return value
+
+
+def _db_form_field(column, value) -> str:
+    name = column["name"]
+    col_type = (column["type"] or "").upper()
+    default_note = ""
+    if column["dflt_value"] is not None:
+        default_note = f"<div class='muted'>빈값이면 기본값: {esc(_db_default_text(column['dflt_value']))}</div>"
+
+    label = f"{esc(name)} <span class='muted'>{esc(column['type'] or 'TEXT')}</span>"
+    value_text = "" if value is None else str(value)
+    if name in DB_TEXTAREA_COLUMNS or len(value_text) > 120:
+        control = f"<textarea name='col_{esc(name)}' rows='4'>{esc(value_text)}</textarea>"
+    else:
+        input_type = "number" if "INT" in col_type else "text"
+        control = f"<input name='col_{esc(name)}' type='{input_type}' value='{esc(value_text)}'>"
+    return f"<div><label>{label}</label>{control}{default_note}</div>"
+
+
+def _db_render_form(table: str, columns, edit_row) -> str:
+    fields = []
+    if edit_row:
+        fields.append(f"<div><label>id</label><input value='{esc(edit_row['id'])}' disabled></div>")
+    for column in columns:
+        if column["pk"]:
+            continue
+        current_value = edit_row[column["name"]] if edit_row else ""
+        fields.append(_db_form_field(column, current_value))
+    submit_label = "행 수정" if edit_row else "행 등록"
+    helper = "raw DB 수준에서 직접 수정합니다. 제약조건과 외래키를 함께 고려해야 합니다."
+    return (
+        "<section class='panel'><h2>행 등록 / 수정</h2>"
+        f"<p class='muted'>{esc(helper)}</p>"
+        "<form action='/admin/database/save' method='post' class='stack'>"
+        f"<input type='hidden' name='table' value='{esc(table)}'>"
+        f"<input type='hidden' name='row_id' value='{esc(edit_row['id'] if edit_row else '')}'>"
+        + "".join(fields)
+        + "<div class='row-actions'>"
+        + f"<button class='btn primary' type='submit'>{esc(submit_label)}</button>"
+        + f"<a class='btn secondary' href='/admin/database?table={esc(table)}'>새 행</a>"
+        + "</div></form></section>"
+    )
+
+
+def _db_cell_preview(value) -> str:
+    text = "" if value is None else str(value)
+    if len(text) > 48:
+        text = text[:45] + "..."
+    return esc(text or "-")
+
+
+def _db_render_rows(table: str, columns, rows) -> str:
+    headers = "".join(f"<th>{esc(column['name'])}</th>" for column in columns)
+    if not rows:
+        return "<section class='panel'><h2>행 목록</h2>" + empty_state("표시할 행이 없습니다.") + "</section>"
+
+    row_html = []
+    for row in rows:
+        cells = "".join(f"<td>{_db_cell_preview(row[column['name']])}</td>" for column in columns)
+        actions = (
+            f"<a class='btn secondary' href='/admin/database?table={esc(table)}&edit={row['id']}'>수정</a>"
+            + "<form method='post' action='/admin/database/delete' style='display:inline;'>"
+            + f"<input type='hidden' name='table' value='{esc(table)}'>"
+            + f"<input type='hidden' name='row_id' value='{esc(row['id'])}'>"
+            + "<button class='btn warn' type='submit'>삭제</button>"
+            + "</form>"
+        )
+        row_html.append(f"<tr>{cells}<td>{actions}</td></tr>")
+
+    return (
+        "<section class='panel'><h2>행 목록</h2><div style='overflow:auto;'>"
+        "<table><thead><tr>"
+        + headers
+        + "<th>관리</th></tr></thead><tbody>"
+        + "".join(row_html)
+        + "</tbody></table></div></section>"
+    )
+
+
+def _db_table_cards(conn, selected_table: str) -> str:
+    cards = []
+    for table in DB_MANAGED_TABLES:
+        count = conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()["count"]
+        tone = "primary" if table == selected_table else "secondary"
+        cards.append(
+            "<div class='panel'>"
+            f"<div class='split'><strong>{esc(DB_TABLE_LABELS[table])}</strong><span class='muted'>{esc(table)}</span></div>"
+            f"<div class='metric-value' style='font-size:28px; margin-top:10px;'>{count}</div>"
+            f"<div class='row-actions' style='margin-top:12px;'><a class='btn {tone}' href='/admin/database?table={esc(table)}'>열기</a></div>"
+            "</div>"
+        )
+    return "".join(cards)
+
+
+def _can_manage_work_order(user, row) -> bool:
+    if auth.has_permission(user["role"], "work_orders:edit"):
+        return True
+    if not row:
+        return False
+    return int(row["created_by"] or 0) == int(user["id"])
+
+
+def _can_update_work_order(user, row) -> bool:
+    if auth.has_permission(user["role"], "work_orders:edit"):
+        return True
+    if not auth.has_permission(user["role"], "work_orders:update"):
+        return False
+    if not row:
+        return False
+    return int(row["created_by"] or 0) == int(user["id"]) or int(row["assignee_user_id"] or 0) == int(user["id"])
+
+
+def _can_delete_work_order(user, row) -> bool:
+    if auth.has_permission(user["role"], "work_orders:edit"):
+        return True
+    if not row:
+        return False
+    return int(row["created_by"] or 0) == int(user["id"])
+
+
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
     redirect = _redirect_if_logged_in(request)
@@ -385,7 +561,15 @@ def login_page(request: Request):
           <form action="/login" method="post" class="stack" style="margin-top:16px;">
             <div><label>아이디</label><input name="username" autocomplete="username" required></div>
             <div><label>비밀번호</label><input name="password" type="password" autocomplete="current-password" required></div>
-            <div class="row-actions"><button class="btn primary" type="submit">로그인</button></div>
+            <div class="row-actions">
+              <button class="btn primary" type="submit">로그인</button>
+              <a class="btn secondary" href="/register">회원가입</a>
+            </div>
+            <div class="muted" style="margin-top:6px;">
+              <a href="/account/username">아이디 찾기</a>
+              &nbsp;·&nbsp;
+              <a href="/account/password">비밀번호 재설정</a>
+            </div>
           </form>
         """
         + "</section>"
@@ -1458,8 +1642,7 @@ def work_orders_page(request: Request):
     if error:
         return error
 
-    can_edit = auth.has_permission(user["role"], "work_orders:edit")
-    can_update = auth.has_permission(user["role"], "work_orders:update")
+    can_create = auth.has_permission(user["role"], "work_orders:create")
     q = request.query_params.get("q", "").strip()
     status = request.query_params.get("status", "").strip()
     priority = request.query_params.get("priority", "").strip()
@@ -1512,48 +1695,64 @@ def work_orders_page(request: Request):
     assignee_options = _user_options(conn, include_viewers=False)
     conn.close()
 
+    can_manage_edit_row = _can_manage_work_order(user, edit_row)
+    can_update_edit_row = _can_update_work_order(user, edit_row)
+    can_delete_edit_row = _can_delete_work_order(user, edit_row)
+
     status_options = ["접수", "진행중", "대기", "보류", "완료", "종결"]
     priority_options = ["낮음", "보통", "높음", "긴급"]
     category_options = ["전기", "기계", "소방", "건축", "민원", "안전", "기타"]
 
     form_html = ""
-    if can_edit:
-        form_html = (
-            "<section class='panel'><h2>작업지시 등록 / 수정</h2><p class='muted'>시설과 담당자를 기준으로 작업을 배정하고 추적합니다.</p>"
-            "<form action='/work-orders/save' method='post' enctype='multipart/form-data' class='stack'>"
-            f"<input type='hidden' name='work_order_id' value='{esc(edit_row['id'] if edit_row else '')}'>"
-            + (
-                f"<div><label>작업 번호</label><input value='{esc(edit_row['work_code'])}' disabled></div>"
-                if edit_row
-                else ""
+    if can_create or edit_row:
+        if edit_row and not (can_manage_edit_row or can_update_edit_row):
+            form_html = info_box("권한 제한", "이 작업지시는 본인 생성 건이나 본인 배정 건일 때만 수정 또는 업데이트할 수 있습니다.")
+        elif edit_row and not can_manage_edit_row:
+            form_html = (
+                "<section class='panel'><h2>작업지시 상세</h2><p class='muted'>기본정보 수정 권한은 없고, 진행 업데이트만 가능합니다.</p>"
+                + "<div class='stack'>"
+                + info_box("작업 번호", esc(edit_row["work_code"]))
+                + info_box("작업 제목", esc(edit_row["title"]))
+                + info_box("작업 내용", esc(edit_row["description"] or "-"))
+                + "</div>"
             )
-            + f"<div><label>분류</label><select name='category'>{render_options(category_options, edit_row['category'] if edit_row else '', blank_label='선택')}</select></div>"
-            + f"<div><label>작업 제목</label><input name='title' value='{esc(edit_row['title'] if edit_row else '')}' required></div>"
-            + f"<div><label>대상 시설</label><select name='facility_id'>{render_options(facility_options, str(edit_row['facility_id'] or '') if edit_row else '', blank_label='미지정')}</select></div>"
-            + "<div class='grid two'>"
-            + f"<div><label>요청자</label><input name='requester_name' value='{esc(edit_row['requester_name'] if edit_row else '')}'></div>"
-            + f"<div><label>담당자</label><select name='assignee_user_id'>{render_options(assignee_options, str(edit_row['assignee_user_id'] or '') if edit_row else '', blank_label='미지정')}</select></div>"
-            + "</div>"
-            + "<div class='grid two'>"
-            + f"<div><label>우선도</label><select name='priority'>{render_options(priority_options, edit_row['priority'] if edit_row else '보통')}</select></div>"
-            + f"<div><label>상태</label><select name='status'>{render_options(status_options, edit_row['status'] if edit_row else '접수')}</select></div>"
-            + "</div>"
-            + f"<div><label>기한</label><input name='due_date' type='date' value='{esc(fmt_date(edit_row['due_date']) if edit_row else '')}'></div>"
-            + f"<div><label>작업 내용</label><textarea name='description'>{esc(edit_row['description'] if edit_row else '')}</textarea></div>"
-            + "<div><label>현장 사진 / 첨부</label><input name='files' type='file' accept='image/*' multiple></div>"
-            + "<div class='row-actions'>"
-            + "<button class='btn primary' type='submit'>저장</button>"
-            + "<a class='btn secondary' href='/work-orders'>새로 입력</a>"
-            + (
-                f"<form action='/work-orders/delete/{edit_row['id']}' method='post' onsubmit=\"return confirm('작업지시를 삭제하시겠습니까?');\"><button class='btn danger' type='submit'>삭제</button></form>"
-                if edit_row
-                else ""
+        else:
+            form_html = (
+                "<section class='panel'><h2>작업지시 등록 / 수정</h2><p class='muted'>시설과 담당자를 기준으로 작업을 배정하고 추적합니다.</p>"
+                "<form action='/work-orders/save' method='post' enctype='multipart/form-data' class='stack'>"
+                f"<input type='hidden' name='work_order_id' value='{esc(edit_row['id'] if edit_row else '')}'>"
+                + (
+                    f"<div><label>작업 번호</label><input value='{esc(edit_row['work_code'])}' disabled></div>"
+                    if edit_row
+                    else ""
+                )
+                + f"<div><label>분류</label><select name='category'>{render_options(category_options, edit_row['category'] if edit_row else '', blank_label='선택')}</select></div>"
+                + f"<div><label>작업 제목</label><input name='title' value='{esc(edit_row['title'] if edit_row else '')}' required></div>"
+                + f"<div><label>대상 시설</label><select name='facility_id'>{render_options(facility_options, str(edit_row['facility_id'] or '') if edit_row else '', blank_label='미지정')}</select></div>"
+                + "<div class='grid two'>"
+                + f"<div><label>요청자</label><input name='requester_name' value='{esc(edit_row['requester_name'] if edit_row else '')}'></div>"
+                + f"<div><label>담당자</label><select name='assignee_user_id'>{render_options(assignee_options, str(edit_row['assignee_user_id'] or '') if edit_row else '', blank_label='미지정')}</select></div>"
+                + "</div>"
+                + "<div class='grid two'>"
+                + f"<div><label>우선도</label><select name='priority'>{render_options(priority_options, edit_row['priority'] if edit_row else '보통')}</select></div>"
+                + f"<div><label>상태</label><select name='status'>{render_options(status_options, edit_row['status'] if edit_row else '접수')}</select></div>"
+                + "</div>"
+                + f"<div><label>기한</label><input name='due_date' type='date' value='{esc(fmt_date(edit_row['due_date']) if edit_row else '')}'></div>"
+                + f"<div><label>작업 내용</label><textarea name='description'>{esc(edit_row['description'] if edit_row else '')}</textarea></div>"
+                + "<div><label>현장 사진 / 첨부</label><input name='files' type='file' accept='image/*' multiple></div>"
+                + "<div class='row-actions'>"
+                + "<button class='btn primary' type='submit'>저장</button>"
+                + "<a class='btn secondary' href='/work-orders'>새로 입력</a>"
+                + (
+                    f"<form action='/work-orders/delete/{edit_row['id']}' method='post' onsubmit=\"return confirm('작업지시를 삭제하시겠습니까?');\"><button class='btn danger' type='submit'>삭제</button></form>"
+                    if edit_row and can_delete_edit_row
+                    else ""
+                )
+                + "</div></form>"
             )
-            + "</div></form>"
-        )
-        if edit_row:
+        if edit_row and (can_manage_edit_row or can_update_edit_row):
             form_html += "<div style='margin-top:14px'><label>현재 첨부</label>" + attachment_gallery(attachments.get(edit_row["id"], [])) + "</div>"
-        if edit_row and can_update:
+        if edit_row and can_update_edit_row:
             updates_html = (
                 "".join(
                     """
@@ -1600,7 +1799,13 @@ def work_orders_page(request: Request):
             due_text = fmt_date(row["due_date"])
             overdue = row["due_date"] and row["due_date"] < _today_text() and row["status"] not in {"완료", "종결"}
             due_badge = status_badge("지연" if overdue else ("완료" if row["status"] in {"완료", "종결"} else "정상"))
-            actions = f"<a class='btn secondary' href='/work-orders?edit={row['id']}'>상세</a>" if (can_edit or can_update) else "<span class='muted'>조회</span>"
+            row_actions = []
+            if _can_manage_work_order(user, row):
+                row_actions.append(f"<a class='btn secondary' href='/work-orders?edit={row['id']}'>수정</a>")
+            elif _can_update_work_order(user, row):
+                row_actions.append(f"<a class='btn secondary' href='/work-orders?edit={row['id']}'>업데이트</a>")
+            else:
+                row_actions.append("<span class='muted'>조회</span>")
             rows_html.append(
                 """
                 <tr>
@@ -1624,7 +1829,7 @@ def work_orders_page(request: Request):
                     due=esc(due_text),
                     due_badge=due_badge,
                     attachments=attachment_gallery(attachments.get(row["id"], [])),
-                    actions=actions,
+                    actions="".join(row_actions),
                 )
             )
         list_html = (
@@ -1671,7 +1876,7 @@ def work_orders_save(
     due_date: str = Form(""),
     files: List[UploadFile] = File(default=[]),
 ):
-    user, error = _authorize(request, "work_orders:edit")
+    user, error = _authorize(request, "work_orders:view")
     if error:
         return error
 
@@ -1682,6 +1887,13 @@ def work_orders_save(
 
     conn = get_conn()
     if work_order_id_i:
+        existing = conn.execute("SELECT * FROM work_orders WHERE id = ?", (work_order_id_i,)).fetchone()
+        if not existing:
+            conn.close()
+            return _with_flash("/work-orders", "작업지시를 찾을 수 없습니다.", "error")
+        if not _can_manage_work_order(user, existing):
+            conn.close()
+            return _with_flash(f"/work-orders?edit={work_order_id_i}", "이 작업지시의 기본정보를 수정할 권한이 없습니다.", "error")
         conn.execute(
             """
             UPDATE work_orders
@@ -1716,6 +1928,10 @@ def work_orders_save(
         conn.commit()
         conn.close()
         return _with_flash(f"/work-orders?edit={work_order_id_i}", "작업지시가 수정되었습니다.", "ok")
+
+    if not auth.has_permission(user["role"], "work_orders:create"):
+        conn.close()
+        return _with_flash("/work-orders", "작업지시를 등록할 권한이 없습니다.", "error")
 
     cursor = conn.execute(
         """
@@ -1775,6 +1991,9 @@ def work_orders_update(
     if not order:
         conn.close()
         return _with_flash("/work-orders", "작업지시를 찾을 수 없습니다.", "error")
+    if not _can_update_work_order(user, order):
+        conn.close()
+        return _with_flash(f"/work-orders?edit={work_order_id}", "이 작업지시를 업데이트할 권한이 없습니다.", "error")
 
     new_status = status.strip() or order["status"]
     completed_at = order["completed_at"]
@@ -1806,10 +2025,17 @@ def work_orders_update(
 
 @app.post("/work-orders/delete/{work_order_id}")
 def work_orders_delete(request: Request, work_order_id: int):
-    user, error = _authorize(request, "work_orders:edit")
+    user, error = _authorize(request, "work_orders:view")
     if error:
         return error
     conn = get_conn()
+    order = conn.execute("SELECT * FROM work_orders WHERE id = ?", (work_order_id,)).fetchone()
+    if not order:
+        conn.close()
+        return _with_flash("/work-orders", "작업지시를 찾을 수 없습니다.", "error")
+    if not _can_delete_work_order(user, order):
+        conn.close()
+        return _with_flash(f"/work-orders?edit={work_order_id}", "이 작업지시를 삭제할 권한이 없습니다.", "error")
     _delete_attachments(conn, "work_order", work_order_id)
     conn.execute("DELETE FROM work_order_updates WHERE work_order_id = ?", (work_order_id,))
     conn.execute("DELETE FROM work_orders WHERE id = ?", (work_order_id,))
@@ -2063,6 +2289,139 @@ def reports_page(request: Request):
         + "</section></div></div>"
     )
     return HTMLResponse(layout(title="운영 보고서", body=body, user=user, flash_message=flash_message, flash_level=flash_level))
+
+
+@app.get("/admin/database", response_class=HTMLResponse)
+def database_page(request: Request):
+    user, error = _authorize(request, "db:raw:view")
+    if error:
+        return error
+
+    selected_table = _db_safe_table(request.query_params.get("table", DB_MANAGED_TABLES[0]))
+    edit_id = _parse_int(request.query_params.get("edit", ""), 0)
+    conn = get_conn()
+    columns = _db_columns(conn, selected_table)
+    rows = conn.execute(f"SELECT * FROM {selected_table} ORDER BY id DESC LIMIT 100").fetchall()
+    edit_row = conn.execute(f"SELECT * FROM {selected_table} WHERE id = ?", (edit_id,)).fetchone() if edit_id else None
+    table_cards = _db_table_cards(conn, selected_table)
+    conn.close()
+
+    flash_message, flash_level = _flash_from_request(request)
+    body = (
+        page_header(
+            "Raw Database Admin",
+            "DB 관리",
+            "모든 운영 테이블을 raw DB 수준에서 직접 조회·등록·수정·삭제합니다.",
+        )
+        + "<div class='layout-2'>"
+        + "<div class='stack'>"
+        + info_box("주의", "sessions 삭제는 즉시 로그아웃 효과를 낼 수 있고, attachments 삭제는 연결된 파일 참조를 제거합니다.")
+        + info_box("입력 방식", "현재 화면은 공통 CRUD 화면이라 외래키는 숫자 id로 직접 입력합니다.")
+        + _db_render_form(selected_table, columns, edit_row)
+        + _db_render_rows(selected_table, columns, rows)
+        + "</div>"
+        + "<div class='stack'>"
+        + table_cards
+        + "</div></div>"
+    )
+    return HTMLResponse(layout(title="DB 관리", body=body, user=user, flash_message=flash_message, flash_level=flash_level))
+
+
+@app.post("/admin/database/save")
+async def database_save(request: Request):
+    user, error = _authorize(request, "db:raw:edit")
+    if error:
+        return error
+
+    form = await request.form()
+    table = _db_safe_table(str(form.get("table", "")))
+    row_id = _parse_int(form.get("row_id", ""), 0)
+    conn = get_conn()
+    columns = _db_columns(conn, table)
+
+    try:
+        if row_id:
+            assignments = []
+            values = []
+            for column in columns:
+                if column["pk"]:
+                    continue
+                converted = _db_convert_value(column, form.get(f"col_{column['name']}", ""), for_create=False)
+                assignments.append(f"{column['name']} = ?")
+                values.append(converted)
+            conn.execute(f"UPDATE {table} SET {', '.join(assignments)} WHERE id = ?", [*values, row_id])
+            conn.commit()
+            conn.close()
+            return _with_flash(f"/admin/database?table={table}&edit={row_id}", "행이 수정되었습니다.", "ok")
+
+        insert_columns = []
+        insert_values = []
+        placeholders = []
+        for column in columns:
+            if column["pk"]:
+                continue
+            converted = _db_convert_value(column, form.get(f"col_{column['name']}", ""), for_create=True)
+            if converted is _DB_OMIT:
+                continue
+            insert_columns.append(column["name"])
+            insert_values.append(converted)
+            placeholders.append("?")
+
+        cursor = conn.execute(
+            f"INSERT INTO {table} ({', '.join(insert_columns)}) VALUES ({', '.join(placeholders)})",
+            insert_values,
+        )
+        conn.commit()
+        new_id = cursor.lastrowid
+        conn.close()
+        return _with_flash(f"/admin/database?table={table}&edit={new_id}", "행이 등록되었습니다.", "ok")
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        target = f"/admin/database?table={table}"
+        if row_id:
+            target += f"&edit={row_id}"
+        return _with_flash(target, f"DB 저장에 실패했습니다: {exc}", "error")
+
+
+@app.post("/admin/database/delete")
+async def database_delete(request: Request):
+    user, error = _authorize(request, "db:raw:edit")
+    if error:
+        return error
+
+    form = await request.form()
+    table = _db_safe_table(str(form.get("table", "")))
+    row_id = _parse_int(form.get("row_id", ""), 0)
+    if not row_id:
+        return _with_flash(f"/admin/database?table={table}", "삭제할 행 id가 필요합니다.", "error")
+
+    conn = get_conn()
+    row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (row_id,)).fetchone()
+    if not row:
+        conn.close()
+        return _with_flash(f"/admin/database?table={table}", "삭제할 행을 찾지 못했습니다.", "error")
+    if table == "users" and row_id == user["id"]:
+        conn.close()
+        return _with_flash(f"/admin/database?table={table}", "현재 로그인한 사용자 행은 삭제할 수 없습니다.", "error")
+
+    file_path = row["file_path"] if table == "attachments" else ""
+    try:
+        conn.execute(f"DELETE FROM {table} WHERE id = ?", (row_id,))
+        conn.commit()
+        conn.close()
+        if file_path:
+            target_file = UPLOAD_DIR / file_path
+            try:
+                if target_file.exists():
+                    target_file.unlink()
+            except OSError:
+                pass
+        return _with_flash(f"/admin/database?table={table}", "행이 삭제되었습니다.", "ok")
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return _with_flash(f"/admin/database?table={table}", f"DB 삭제에 실패했습니다: {exc}", "error")
 
 
 @app.get("/admin/users", response_class=HTMLResponse)
