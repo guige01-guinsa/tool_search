@@ -29,6 +29,10 @@ Write-Host "실행 파일 빌드"
     --onedir `
     --console `
     --name $appName `
+    --hidden-import ops_main `
+    --hidden-import ops.auth `
+    --hidden-import ops.db `
+    --hidden-import ops.ui `
     --hidden-import uvicorn.logging `
     --hidden-import uvicorn.loops.auto `
     --hidden-import uvicorn.protocols.http.auto `
@@ -41,8 +45,15 @@ Write-Host "실행 파일 빌드"
 $runtimeDataDir = Join-Path $targetDir "runtime_data"
 $runtimeUploadsDir = Join-Path $runtimeDataDir "uploads"
 $runtimeCertsDir = Join-Path $runtimeDataDir "certs"
+$assetsTargetDir = Join-Path $targetDir "assets"
 New-Item -ItemType Directory -Force -Path $runtimeUploadsDir | Out-Null
 New-Item -ItemType Directory -Force -Path $runtimeCertsDir | Out-Null
+
+$assetsSource = Join-Path $root "assets"
+if (Test-Path $assetsSource) {
+    Write-Host "정적 자산 복사"
+    Copy-Item $assetsSource $assetsTargetDir -Recurse -Force
+}
 
 $dbSource = Join-Path $root "operations.db"
 if (Test-Path $dbSource) {
