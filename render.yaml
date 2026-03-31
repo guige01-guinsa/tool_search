@@ -20,3 +20,7 @@ services:
         value: 시스템 관리자
       - key: OPS_ADMIN_PASSWORD
         sync: false
+      - key: LEGACY_RENDER_SERVICE_ID
+        value: srv-d6g57jbuibrs739g5mvg
+      - key: LEGACY_DATABASE_URL
+        sync: false

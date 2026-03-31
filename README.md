@@ -86,6 +86,8 @@ uvicorn ops_main:app --host 0.0.0.0 --port $env:PORT
 - 기본값은 이전 Render 서비스의 `DATABASE_URL`을 `RENDER_API_KEY`로 읽어오며, 외부 접속용 Postgres URL로 자동 변환한다.
 - `LEGACY_DATABASE_URL` 또는 `--legacy-db-url`를 주면 직접 지정한 PostgreSQL URL도 사용할 수 있다.
 - 기존에 이미 들어간 `LGCY-*` 코드가 있으면 기본은 건너뛰고, `--update-existing`일 때만 덮어쓴다.
+- 관리자 화면에서도 `DB관리 > 레거시 민원 이관` 패널에서 `원본 확인`, `드라이런`, `실제 이관`을 실행할 수 있다.
+- 운영 배포본에서 버튼으로 바로 돌리려면 `LEGACY_DATABASE_URL` 환경변수에 이전 DB 접속 문자열을 넣어 두는 편이 가장 단순하다.
 
 ## Render 배포
 
