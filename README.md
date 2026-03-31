@@ -77,6 +77,16 @@ uvicorn ops_main:app --host 0.0.0.0 --port $env:PORT
 - `만족도 기록`: 민원별 1~5점 만족도와 후속 연락일, 코멘트를 기록
 - `회신 템플릿`: 공통/분류별 회신 템플릿을 기본 제공하고 `DB관리 > complaint_response_templates`에서 수정 가능
 
+## 이전 민원 DB 이관
+
+- 레거시 Render 서비스의 `work_orders`, `work_order_events`를 현재 `complaints`, `complaint_updates`, `work_orders`로 옮기는 스크립트: `python scripts/import_legacy_complaints.py`
+- 원본 건수만 확인: `python scripts/import_legacy_complaints.py --inspect`
+- 실제 쓰기 없이 드라이런: `python scripts/import_legacy_complaints.py`
+- 실제 이관 실행: `python scripts/import_legacy_complaints.py --apply`
+- 기본값은 이전 Render 서비스의 `DATABASE_URL`을 `RENDER_API_KEY`로 읽어오며, 외부 접속용 Postgres URL로 자동 변환한다.
+- `LEGACY_DATABASE_URL` 또는 `--legacy-db-url`를 주면 직접 지정한 PostgreSQL URL도 사용할 수 있다.
+- 기존에 이미 들어간 `LGCY-*` 코드가 있으면 기본은 건너뛰고, `--update-existing`일 때만 덮어쓴다.
+
 ## Render 배포
 
 이 저장소에는 `render.yaml`이 포함되어 있다.
