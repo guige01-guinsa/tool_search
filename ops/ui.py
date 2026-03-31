@@ -394,20 +394,25 @@ def layout(
       flex-wrap: wrap;
       margin-top: 14px;
     }}
-    table {{
-      width: 100%;
-      border-collapse: collapse;
-      background: #fffefb;
-      border-radius: 20px;
-      overflow: hidden;
-    }}
-    th, td {{
-      padding: 12px 10px;
-      border-bottom: 1px solid rgba(23, 33, 43, 0.08);
-      text-align: left;
-      vertical-align: top;
-      font-size: 14px;
-    }}
+      table {{
+        width: 100%;
+        border-collapse: collapse;
+        background: #fffefb;
+        border-radius: 20px;
+        overflow: hidden;
+      }}
+      .db-table {{
+        table-layout: fixed;
+      }}
+      th, td {{
+        padding: 12px 10px;
+        border-bottom: 1px solid rgba(23, 33, 43, 0.08);
+        text-align: left;
+        vertical-align: top;
+        font-size: 14px;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }}
     th {{
       font-size: 12px;
       color: var(--muted);
@@ -445,6 +450,17 @@ def layout(
       flex-wrap: wrap;
     }}
     .inline-form > * {{ flex: 1 1 120px; }}
+    .db-check-cell {{
+      width: 56px;
+      text-align: center;
+    }}
+    .db-check-cell input {{
+      margin: 0 auto;
+    }}
+    .db-action-cell .btn {{
+      margin-right: 6px;
+      margin-bottom: 6px;
+    }}
     .thumb-grid {{
       display: flex;
       gap: 8px;
@@ -515,11 +531,63 @@ def layout(
       .hero h1 {{ font-size: 26px; }}
       .metrics {{ grid-template-columns: 1fr; }}
       .grid.two {{ grid-template-columns: 1fr; }}
+      .panel {{ padding: 14px; border-radius: 18px; }}
+      th, td {{ padding: 10px 8px; }}
       .top-actions {{ width: 100%; justify-content: stretch; }}
       .top-actions form, .top-actions a {{ flex: 1 1 auto; }}
       .top-actions .btn {{ width: 100%; }}
       .nav-link {{ flex: 1 1 auto; text-align: center; }}
       .flash.install-tip {{ align-items: flex-start; }}
+      .responsive-table thead {{
+        display: none;
+      }}
+      .responsive-table,
+      .responsive-table tbody,
+      .responsive-table tr,
+      .responsive-table td {{
+        display: block;
+        width: 100%;
+      }}
+      .responsive-table {{
+        border-radius: 18px;
+      }}
+      .responsive-table tr {{
+        border-bottom: 1px solid rgba(23, 33, 43, 0.08);
+        padding: 12px 0;
+      }}
+      .responsive-table tr:last-child {{
+        border-bottom: none;
+      }}
+        .responsive-table td {{
+          border-bottom: none;
+          padding: 6px 0;
+          font-size: 13px;
+          overflow-wrap: anywhere;
+          word-break: break-word;
+        }}
+      .responsive-table td::before {{
+        content: attr(data-label);
+        display: block;
+        margin-bottom: 4px;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+      }}
+      .responsive-table .db-check-cell {{
+        text-align: left;
+      }}
+      .responsive-table .db-check-cell input {{
+        margin: 0;
+      }}
+      .responsive-table .db-action-cell {{
+        padding-top: 10px;
+      }}
+      .responsive-table .db-action-cell .btn {{
+        width: 100%;
+        margin-right: 0;
+      }}
     }}
   </style>
 </head>

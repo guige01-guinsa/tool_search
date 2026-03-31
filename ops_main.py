@@ -755,17 +755,22 @@ def _db_render_rows(table: str, columns, rows) -> str:
     row_html = []
     for row in rows:
         checkbox = (
-            f"<td><input type='checkbox' name='row_ids' value='{esc(row['id'])}' "
-            f"data-db-row='1' style='width:18px;height:18px;'></td>"
+            f"<input type='checkbox' name='row_ids' value='{esc(row['id'])}' "
+            f"data-db-row='1' style='width:18px;height:18px;'>"
         )
-        cells = "".join(f"<td>{_db_cell_preview(row[column['name']])}</td>" for column in columns)
+        cells = "".join(
+            f"<td data-label='{esc(column['name'])}'>{_db_cell_preview(row[column['name']])}</td>"
+            for column in columns
+        )
         actions = (
             f"<a class='btn secondary' href='/admin/database?table={esc(table)}&edit={row['id']}'>수정</a>"
             + f"<button class='btn warn' type='submit' name='row_id' value='{esc(row['id'])}' "
             + "formaction='/admin/database/delete' formmethod='post' formnovalidate "
             + "onclick=\"return confirm('이 행을 삭제하시겠습니까?');\">삭제</button>"
         )
-        row_html.append(f"<tr>{checkbox}{cells}<td>{actions}</td></tr>")
+        row_html.append(
+            f"<tr><td data-label='선택' class='db-check-cell'>{checkbox}</td>{cells}<td data-label='관리' class='db-action-cell'>{actions}</td></tr>"
+        )
 
     return (
         "<section class='panel'><h2>행 목록</h2><div style='overflow:auto;'>"
@@ -775,7 +780,7 @@ def _db_render_rows(table: str, columns, rows) -> str:
         + "<button class='btn warn' type='submit' onclick=\"return confirm('선택한 행을 한꺼번에 삭제하시겠습니까?');\">선택 삭제</button>"
         + "<span class='muted'>체크한 행만 삭제합니다. 현재 로그인한 사용자 행은 제외됩니다.</span>"
         + "</div>"
-        + "<table><thead><tr>"
+        + "<table class='responsive-table db-table'><thead><tr>"
         + "<th><input type='checkbox' data-db-select-all='1' style='width:18px;height:18px;'></th>"
         + headers
         + "<th>관리</th></tr></thead><tbody>"
