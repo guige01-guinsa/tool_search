@@ -31,6 +31,12 @@ $env:PORT=8000
 uvicorn ops_main:app --host 0.0.0.0 --port $env:PORT
 ```
 
+## 점검 / 테스트
+
+- 문법 점검: `python -m py_compile ops_main.py scripts\check_crud_flows.py scripts\check_stability_flows.py scripts\import_legacy_complaints.py`
+- CRUD 회귀 점검: `python scripts/check_crud_flows.py`
+- 안정화 스모크 점검: `python scripts/check_stability_flows.py`
+
 ## 초기 관리자
 
 - 아이디: `admin`

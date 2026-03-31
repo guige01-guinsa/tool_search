@@ -4390,4 +4390,13 @@ def users_delete(request: Request, user_id: int):
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "service": "facility-operations"}
+    try:
+        conn = get_conn()
+        conn.execute("SELECT 1").fetchone()
+        conn.close()
+    except Exception as exc:
+        return JSONResponse(
+            status_code=503,
+            content={"ok": False, "service": "facility-operations", "db": "error", "detail": str(exc)},
+        )
+    return {"ok": True, "service": "facility-operations", "db": "ok"}
