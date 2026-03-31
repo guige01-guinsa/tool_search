@@ -460,6 +460,58 @@ def main() -> None:
         expect(raw_delete.status_code in {302, 303}, "DB관리 행 삭제 요청이 실패했습니다.")
         expect(fetchone("SELECT * FROM inventory_items WHERE id = ?", (raw_id,)) is None, "DB관리 삭제가 반영되지 않았습니다.")
 
+        bulk_name_a = f"bulk-item-a-{suffix}"
+        bulk_name_b = f"bulk-item-b-{suffix}"
+        for bulk_name in (bulk_name_a, bulk_name_b):
+            bulk_create = client.post(
+                "/admin/database/save",
+                data={
+                    "table": "inventory_items",
+                    "row_id": "",
+                    "col_item_code": "",
+                    "col_category": "기타",
+                    "col_name": bulk_name,
+                    "col_specification": "",
+                    "col_quantity": "2",
+                    "col_unit": "개",
+                    "col_location": "",
+                    "col_status": "정상",
+                    "col_min_quantity": "0",
+                    "col_purchase_date": "",
+                    "col_purchase_amount": "0",
+                    "col_note": "",
+                    "col_legacy_tool_id": "",
+                    "col_created_by": "1",
+                    "col_updated_by": "1",
+                    "col_created_at": "",
+                    "col_updated_at": "",
+                },
+                follow_redirects=False,
+            )
+            expect(bulk_create.status_code in {302, 303}, "DB관리 bulk 삭제용 행 등록 요청이 실패했습니다.")
+
+        bulk_row_a = fetchone("SELECT * FROM inventory_items WHERE name = ?", (bulk_name_a,))
+        bulk_row_b = fetchone("SELECT * FROM inventory_items WHERE name = ?", (bulk_name_b,))
+        expect(bulk_row_a is not None and bulk_row_b is not None, "DB관리 bulk 삭제용 행이 생성되지 않았습니다.")
+
+        raw_page = client.get("/admin/database?table=inventory_items")
+        expect(
+            raw_page.status_code == 200 and "/admin/database/delete-selected" in raw_page.text and "data-db-select-all" in raw_page.text,
+            "DB관리 화면에 bulk 삭제 UI가 반영되지 않았습니다.",
+        )
+
+        bulk_delete = client.post(
+            "/admin/database/delete-selected",
+            data={
+                "table": "inventory_items",
+                "row_ids": [str(bulk_row_a["id"]), str(bulk_row_b["id"])],
+            },
+            follow_redirects=False,
+        )
+        expect(bulk_delete.status_code in {302, 303}, "DB관리 bulk 삭제 요청이 실패했습니다.")
+        expect(fetchone("SELECT * FROM inventory_items WHERE id = ?", (bulk_row_a["id"],)) is None, "DB관리 bulk 삭제 첫 번째 행이 반영되지 않았습니다.")
+        expect(fetchone("SELECT * FROM inventory_items WHERE id = ?", (bulk_row_b["id"],)) is None, "DB관리 bulk 삭제 두 번째 행이 반영되지 않았습니다.")
+
         repeat_delete = client.post(f"/complaints/delete/{repeat_id}", follow_redirects=False)
         expect(repeat_delete.status_code in {302, 303}, "반복 민원 삭제 요청이 실패했습니다.")
         expect(fetchone("SELECT * FROM complaints WHERE id = ?", (repeat_id,)) is None, "반복 민원이 삭제되지 않았습니다.")

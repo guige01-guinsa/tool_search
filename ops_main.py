@@ -751,27 +751,79 @@ def _db_render_rows(table: str, columns, rows) -> str:
     if not rows:
         return "<section class='panel'><h2>행 목록</h2>" + empty_state("표시할 행이 없습니다.") + "</section>"
 
+    form_id = f"db-bulk-form-{table}"
     row_html = []
     for row in rows:
+        checkbox = (
+            f"<td><input type='checkbox' name='row_ids' value='{esc(row['id'])}' "
+            f"data-db-row='1' style='width:18px;height:18px;'></td>"
+        )
         cells = "".join(f"<td>{_db_cell_preview(row[column['name']])}</td>" for column in columns)
         actions = (
             f"<a class='btn secondary' href='/admin/database?table={esc(table)}&edit={row['id']}'>수정</a>"
-            + "<form method='post' action='/admin/database/delete' style='display:inline;'>"
-            + f"<input type='hidden' name='table' value='{esc(table)}'>"
-            + f"<input type='hidden' name='row_id' value='{esc(row['id'])}'>"
-            + "<button class='btn warn' type='submit'>삭제</button>"
-            + "</form>"
+            + f"<button class='btn warn' type='submit' name='row_id' value='{esc(row['id'])}' "
+            + "formaction='/admin/database/delete' formmethod='post' formnovalidate "
+            + "onclick=\"return confirm('이 행을 삭제하시겠습니까?');\">삭제</button>"
         )
-        row_html.append(f"<tr>{cells}<td>{actions}</td></tr>")
+        row_html.append(f"<tr>{checkbox}{cells}<td>{actions}</td></tr>")
 
     return (
         "<section class='panel'><h2>행 목록</h2><div style='overflow:auto;'>"
-        "<table><thead><tr>"
+        f"<form id='{esc(form_id)}' method='post' action='/admin/database/delete-selected' class='stack'>"
+        f"<input type='hidden' name='table' value='{esc(table)}'>"
+        + "<div class='row-actions' style='margin-bottom:12px;'>"
+        + "<button class='btn warn' type='submit' onclick=\"return confirm('선택한 행을 한꺼번에 삭제하시겠습니까?');\">선택 삭제</button>"
+        + "<span class='muted'>체크한 행만 삭제합니다. 현재 로그인한 사용자 행은 제외됩니다.</span>"
+        + "</div>"
+        + "<table><thead><tr>"
+        + "<th><input type='checkbox' data-db-select-all='1' style='width:18px;height:18px;'></th>"
         + headers
         + "<th>관리</th></tr></thead><tbody>"
         + "".join(row_html)
-        + "</tbody></table></div></section>"
+        + "</tbody></table>"
+        + "<div class='row-actions' style='margin-top:12px;'>"
+        + "<button class='btn warn' type='submit' onclick=\"return confirm('선택한 행을 한꺼번에 삭제하시겠습니까?');\">선택 삭제</button>"
+        + "</div>"
+        + "</form>"
+        + "<script>(function(){const form=document.getElementById('"
+        + esc(form_id)
+        + "');if(!form)return;const master=form.querySelector('[data-db-select-all]');if(!master)return;master.addEventListener('change',()=>{form.querySelectorAll('[data-db-row]').forEach((box)=>{box.checked=master.checked;});});form.querySelectorAll('[data-db-row]').forEach((box)=>{box.addEventListener('change',()=>{const items=[...form.querySelectorAll('[data-db-row]')];master.checked=items.length>0&&items.every((item)=>item.checked);});});})();</script>"
+        + "</div></section>"
     )
+
+
+def _db_delete_rows(conn, table: str, row_ids: list[int], current_user_id: int) -> tuple[int, int, int, list[str]]:
+    unique_ids = sorted({row_id for row_id in row_ids if row_id > 0})
+    if not unique_ids:
+        return 0, 0, 0, []
+
+    placeholders = ",".join("?" for _ in unique_ids)
+    rows = conn.execute(
+        f"SELECT * FROM {table} WHERE id IN ({placeholders})",
+        unique_ids,
+    ).fetchall()
+    found_ids = {int(row["id"]) for row in rows}
+    missing_count = len(unique_ids) - len(found_ids)
+
+    delete_ids: list[int] = []
+    file_paths: list[str] = []
+    blocked_count = 0
+    for row in rows:
+        row_id = int(row["id"])
+        if table == "users" and row_id == current_user_id:
+            blocked_count += 1
+            continue
+        delete_ids.append(row_id)
+        if table == "attachments" and row["file_path"]:
+            file_paths.append(str(row["file_path"]))
+
+    if delete_ids:
+        delete_placeholders = ",".join("?" for _ in delete_ids)
+        conn.execute(
+            f"DELETE FROM {table} WHERE id IN ({delete_placeholders})",
+            delete_ids,
+        )
+    return len(delete_ids), blocked_count, missing_count, file_paths
 
 
 def _db_table_cards(conn, selected_table: str) -> str:
@@ -4095,20 +4147,17 @@ async def database_delete(request: Request):
         return _with_flash(f"/admin/database?table={table}", "삭제할 행 id가 필요합니다.", "error")
 
     conn = get_conn()
-    row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (row_id,)).fetchone()
-    if not row:
-        conn.close()
-        return _with_flash(f"/admin/database?table={table}", "삭제할 행을 찾지 못했습니다.", "error")
-    if table == "users" and row_id == user["id"]:
-        conn.close()
-        return _with_flash(f"/admin/database?table={table}", "현재 로그인한 사용자 행은 삭제할 수 없습니다.", "error")
-
-    file_path = row["file_path"] if table == "attachments" else ""
     try:
-        conn.execute(f"DELETE FROM {table} WHERE id = ?", (row_id,))
+        deleted_count, blocked_count, missing_count, file_paths = _db_delete_rows(conn, table, [row_id], int(user["id"]))
+        if missing_count:
+            conn.close()
+            return _with_flash(f"/admin/database?table={table}", "삭제할 행을 찾지 못했습니다.", "error")
+        if blocked_count and not deleted_count:
+            conn.close()
+            return _with_flash(f"/admin/database?table={table}", "현재 로그인한 사용자 행은 삭제할 수 없습니다.", "error")
         conn.commit()
         conn.close()
-        if file_path:
+        for file_path in file_paths:
             target_file = UPLOAD_DIR / file_path
             try:
                 if target_file.exists():
@@ -4120,6 +4169,49 @@ async def database_delete(request: Request):
         conn.rollback()
         conn.close()
         return _with_flash(f"/admin/database?table={table}", f"DB 삭제에 실패했습니다: {exc}", "error")
+
+
+@app.post("/admin/database/delete-selected")
+async def database_delete_selected(request: Request):
+    user, error = _authorize(request, "db:raw:edit")
+    if error:
+        return error
+
+    form = await request.form()
+    table = _db_safe_table(str(form.get("table", "")))
+    row_ids = [_parse_int(value, 0) for value in form.getlist("row_ids")]
+    row_ids = [row_id for row_id in row_ids if row_id > 0]
+    if not row_ids:
+        return _with_flash(f"/admin/database?table={table}", "삭제할 행을 하나 이상 선택해 주세요.", "error")
+
+    conn = get_conn()
+    try:
+        deleted_count, blocked_count, missing_count, file_paths = _db_delete_rows(conn, table, row_ids, int(user["id"]))
+        if not deleted_count:
+            conn.close()
+            if blocked_count:
+                return _with_flash(f"/admin/database?table={table}", "현재 로그인한 사용자 행은 선택 삭제할 수 없습니다.", "error")
+            return _with_flash(f"/admin/database?table={table}", "삭제 가능한 행이 없습니다.", "error")
+        conn.commit()
+        conn.close()
+        for file_path in file_paths:
+            target_file = UPLOAD_DIR / file_path
+            try:
+                if target_file.exists():
+                    target_file.unlink()
+            except OSError:
+                pass
+
+        message = f"{deleted_count}개 행이 삭제되었습니다."
+        if blocked_count:
+            message += f" 현재 로그인 사용자 {blocked_count}개는 제외했습니다."
+        if missing_count:
+            message += f" 찾지 못한 {missing_count}개는 건너뛰었습니다."
+        return _with_flash(f"/admin/database?table={table}", message, "ok")
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return _with_flash(f"/admin/database?table={table}", f"선택 삭제에 실패했습니다: {exc}", "error")
 
 
 @app.get("/admin/users", response_class=HTMLResponse)

@@ -67,6 +67,7 @@ uvicorn ops_main:app --host 0.0.0.0 --port $env:PORT
 ## DB 관리
 
 - 관리자 로그인 후 상단 `DB관리` 메뉴에서만 모든 운영 테이블을 raw DB 수준으로 조회·등록·수정·삭제 가능
+- 목록 화면에서 체크박스로 여러 행을 선택한 뒤 `선택 삭제`로 일괄 삭제 가능
 - 대상 테이블: `users`, `sessions`, `facilities`, `inventory_items`, `inventory_transactions`, `complaints`, `complaint_updates`, `complaint_feedback`, `complaint_response_templates`, `work_orders`, `work_order_updates`, `attachments`
 
 ## 권한 분리
