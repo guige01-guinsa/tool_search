@@ -18,6 +18,10 @@ ROLE_LABELS = {
 
 ROLE_PERMISSIONS = {
     "admin": {
+        "complaints:view",
+        "complaints:create",
+        "complaints:edit",
+        "complaints:update",
         "dashboard:view",
         "db:raw:view",
         "db:raw:edit",
@@ -34,6 +38,10 @@ ROLE_PERMISSIONS = {
         "users:manage",
     },
     "manager": {
+        "complaints:view",
+        "complaints:create",
+        "complaints:edit",
+        "complaints:update",
         "dashboard:view",
         "facilities:view",
         "facilities:edit",
@@ -47,6 +55,9 @@ ROLE_PERMISSIONS = {
         "reports:view",
     },
     "technician": {
+        "complaints:view",
+        "complaints:create",
+        "complaints:update",
         "dashboard:view",
         "facilities:view",
         "inventory:view",
@@ -57,6 +68,7 @@ ROLE_PERMISSIONS = {
         "reports:view",
     },
     "viewer": {
+        "complaints:view",
         "dashboard:view",
         "facilities:view",
         "inventory:view",

@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-import tempfile
 import uuid
 from pathlib import Path
 
@@ -19,7 +18,10 @@ def expect(condition: bool, message: str) -> None:
 
 
 def main() -> None:
-    tmp_path = Path(tempfile.mkdtemp(prefix="ops-crud-check-"))
+    tmp_path = ROOT_DIR / f"tmp_ops_crud_check_{uuid.uuid4().hex[:8]}"
+    if tmp_path.exists():
+        shutil.rmtree(tmp_path, ignore_errors=True)
+    tmp_path.mkdir(parents=True, exist_ok=True)
     client = None
     try:
         os.environ["OPS_DB_PATH"] = str(tmp_path / "operations.db")
@@ -91,6 +93,97 @@ def main() -> None:
         facility_row = fetchone("SELECT * FROM facilities WHERE id = ?", (facility_id,))
         expect(facility_row["name"].endswith("-수정"), "시설 수정이 반영되지 않았습니다.")
 
+        complaint_title = f"검증민원-{suffix}"
+        complaint_create = client.post(
+            "/complaints/save",
+            data={
+                "channel": "전화",
+                "category_primary": "전기",
+                "category_secondary": "조명",
+                "facility_id": str(facility_id),
+                "unit_label": "101동 1203호",
+                "location_detail": "거실 천장",
+                "requester_name": "검증민원인",
+                "requester_phone": "01011112222",
+                "requester_email": "test@example.com",
+                "title": complaint_title,
+                "description": "민원 생성 검증",
+                "priority": "높음",
+                "status": "접수",
+                "response_due_at": "2026-03-31",
+                "assignee_user_id": "",
+            },
+            follow_redirects=False,
+        )
+        expect(complaint_create.status_code in {302, 303}, "민원 등록 요청이 실패했습니다.")
+        complaint_row = fetchone("SELECT * FROM complaints WHERE title = ?", (complaint_title,))
+        expect(complaint_row is not None, "민원이 생성되지 않았습니다.")
+        complaint_id = complaint_row["id"]
+
+        complaint_page = client.get(f"/complaints?edit={complaint_id}")
+        expect(complaint_page.status_code == 200 and "formaction='/complaints/delete/" in complaint_page.text, "민원 수정 화면의 삭제 버튼 구조가 올바르지 않습니다.")
+
+        complaint_update = client.post(
+            "/complaints/save",
+            data={
+                "complaint_id": str(complaint_id),
+                "channel": "모바일",
+                "category_primary": "기계",
+                "category_secondary": "환기",
+                "facility_id": str(facility_id),
+                "unit_label": "101동 1203호",
+                "location_detail": "욕실 환풍기",
+                "requester_name": "검증민원인",
+                "requester_phone": "01011113333",
+                "requester_email": "updated@example.com",
+                "title": f"{complaint_title}-수정",
+                "description": "민원 수정 검증",
+                "priority": "긴급",
+                "status": "접수",
+                "response_due_at": "2026-04-01",
+                "assignee_user_id": "",
+            },
+            follow_redirects=False,
+        )
+        expect(complaint_update.status_code in {302, 303}, "민원 수정 요청이 실패했습니다.")
+        complaint_row = fetchone("SELECT * FROM complaints WHERE id = ?", (complaint_id,))
+        expect(complaint_row["title"].endswith("-수정") and complaint_row["priority"] == "긴급", "민원 수정이 반영되지 않았습니다.")
+        template_row = fetchone("SELECT * FROM complaint_response_templates WHERE name = ?", ("접수 안내",))
+        expect(template_row is not None, "민원 회신 템플릿 기본값이 생성되지 않았습니다.")
+
+        repeat_title = f"반복민원-{suffix}"
+        repeat_create = client.post(
+            "/complaints/save",
+            data={
+                "channel": "전화",
+                "category_primary": "기계",
+                "category_secondary": "환기",
+                "facility_id": str(facility_id),
+                "unit_label": "101동 1203호",
+                "location_detail": "욕실 환풍기",
+                "requester_name": "검증민원인",
+                "requester_phone": "01011113333",
+                "requester_email": "repeat@example.com",
+                "title": repeat_title,
+                "description": "반복 민원 감지 검증",
+                "priority": "보통",
+                "status": "접수",
+                "response_due_at": "",
+                "assignee_user_id": "",
+            },
+            follow_redirects=False,
+        )
+        expect(repeat_create.status_code in {302, 303}, "반복 민원 등록 요청이 실패했습니다.")
+        repeat_row = fetchone("SELECT * FROM complaints WHERE title = ?", (repeat_title,))
+        expect(repeat_row is not None, "반복 민원이 생성되지 않았습니다.")
+        repeat_id = repeat_row["id"]
+
+        complaint_detail = client.get(f"/complaints?edit={complaint_id}")
+        expect(
+            complaint_detail.status_code == 200 and "반복 민원 감지" in complaint_detail.text and repeat_title in complaint_detail.text,
+            "반복 민원 감지 화면이 올바르게 표시되지 않습니다.",
+        )
+
         inventory_name = f"검증재고-{suffix}"
         inventory_create = client.post(
             "/inventory/save",
@@ -154,6 +247,7 @@ def main() -> None:
         work_create = client.post(
             "/work-orders/save",
             data={
+                "complaint_id": str(complaint_id),
                 "category": "전기",
                 "title": work_title,
                 "facility_id": str(facility_id),
@@ -170,6 +264,9 @@ def main() -> None:
         work_row = fetchone("SELECT * FROM work_orders WHERE title = ?", (work_title,))
         expect(work_row is not None, "작업지시가 생성되지 않았습니다.")
         work_id = work_row["id"]
+        expect(work_row["complaint_id"] == complaint_id, "작업지시에 민원 연결이 저장되지 않았습니다.")
+        complaint_row = fetchone("SELECT * FROM complaints WHERE id = ?", (complaint_id,))
+        expect(complaint_row["status"] == "배정완료", "민원 상태가 작업지시 연결에 맞게 갱신되지 않았습니다.")
 
         work_page = client.get(f"/work-orders?edit={work_id}")
         expect(work_page.status_code == 200 and "formaction='/work-orders/delete/" in work_page.text, "작업지시 수정 화면의 삭제 버튼 구조가 올바르지 않습니다.")
@@ -178,6 +275,7 @@ def main() -> None:
             "/work-orders/save",
             data={
                 "work_order_id": str(work_id),
+                "complaint_id": str(complaint_id),
                 "category": "기계",
                 "title": f"{work_title}-수정",
                 "facility_id": str(facility_id),
@@ -193,6 +291,31 @@ def main() -> None:
         expect(work_update.status_code in {302, 303}, "작업지시 수정 요청이 실패했습니다.")
         work_row = fetchone("SELECT * FROM work_orders WHERE id = ?", (work_id,))
         expect(work_row["title"].endswith("-수정") and work_row["status"] == "진행중", "작업지시 수정이 반영되지 않았습니다.")
+
+        complaint_progress = client.post(
+            f"/complaints/update/{complaint_id}",
+            data={"update_type": "상태변경", "message": "현장 확인 후 처리중으로 전환", "status": "처리중", "is_public_note": "1"},
+            follow_redirects=False,
+        )
+        expect(complaint_progress.status_code in {302, 303}, "민원 업데이트 요청이 실패했습니다.")
+        complaint_row = fetchone("SELECT * FROM complaints WHERE id = ?", (complaint_id,))
+        expect(complaint_row["status"] == "처리중", "민원 상태 업데이트가 반영되지 않았습니다.")
+        complaint_update_count = fetchone("SELECT COUNT(*) AS count FROM complaint_updates WHERE complaint_id = ?", (complaint_id,))["count"]
+        expect(complaint_update_count >= 3, "민원 이력이 충분히 생성되지 않았습니다.")
+
+        complaint_feedback = client.post(
+            f"/complaints/feedback/{complaint_id}",
+            data={"rating": "4", "comment": "조치 속도가 빨랐습니다.", "follow_up_at": "2026-04-02"},
+            follow_redirects=False,
+        )
+        expect(complaint_feedback.status_code in {302, 303}, "민원 만족도 저장 요청이 실패했습니다.")
+        feedback_row = fetchone("SELECT * FROM complaint_feedback WHERE complaint_id = ?", (complaint_id,))
+        expect(
+            feedback_row is not None and feedback_row["rating"] == 4 and feedback_row["comment"] == "조치 속도가 빨랐습니다.",
+            "민원 만족도 저장이 반영되지 않았습니다.",
+        )
+        complaint_update_count = fetchone("SELECT COUNT(*) AS count FROM complaint_updates WHERE complaint_id = ?", (complaint_id,))["count"]
+        expect(complaint_update_count >= 4, "민원 만족도 기록 이력이 생성되지 않았습니다.")
 
         work_progress = client.post(
             f"/work-orders/update/{work_id}",
@@ -311,6 +434,12 @@ def main() -> None:
         expect(inventory_delete.status_code in {302, 303}, "재고 삭제 요청이 실패했습니다.")
         expect(fetchone("SELECT * FROM inventory_items WHERE id = ?", (inventory_id,)) is None, "재고가 삭제되지 않았습니다.")
 
+        complaint_delete = client.post(f"/complaints/delete/{complaint_id}", follow_redirects=False)
+        expect(complaint_delete.status_code in {302, 303}, "민원 삭제 요청이 실패했습니다.")
+        expect(fetchone("SELECT * FROM complaints WHERE id = ?", (complaint_id,)) is None, "민원이 삭제되지 않았습니다.")
+        work_row = fetchone("SELECT * FROM work_orders WHERE id = ?", (work_id,))
+        expect(work_row is not None and work_row["complaint_id"] is None, "민원 삭제 시 연결 작업지시 해제가 반영되지 않았습니다.")
+
         work_delete = client.post(f"/work-orders/delete/{work_id}", follow_redirects=False)
         expect(work_delete.status_code in {302, 303}, "작업지시 삭제 요청이 실패했습니다.")
         expect(fetchone("SELECT * FROM work_orders WHERE id = ?", (work_id,)) is None, "작업지시가 삭제되지 않았습니다.")
@@ -330,6 +459,10 @@ def main() -> None:
         )
         expect(raw_delete.status_code in {302, 303}, "DB관리 행 삭제 요청이 실패했습니다.")
         expect(fetchone("SELECT * FROM inventory_items WHERE id = ?", (raw_id,)) is None, "DB관리 삭제가 반영되지 않았습니다.")
+
+        repeat_delete = client.post(f"/complaints/delete/{repeat_id}", follow_redirects=False)
+        expect(repeat_delete.status_code in {302, 303}, "반복 민원 삭제 요청이 실패했습니다.")
+        expect(fetchone("SELECT * FROM complaints WHERE id = ?", (repeat_id,)) is None, "반복 민원이 삭제되지 않았습니다.")
 
         print("OK: CRUD flows verified")
     finally:

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+import json
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, List
 from urllib.parse import urlencode
@@ -66,6 +67,17 @@ def _today_text() -> str:
 def _month_start_text() -> str:
     today = date.today()
     return today.replace(day=1).strftime("%Y-%m-%d")
+
+
+COMPLAINT_STATUS_OPTIONS = ["접수", "분류완료", "배정완료", "처리중", "처리완료", "회신완료", "종결", "보류", "취소", "재오픈"]
+COMPLAINT_PRIORITY_OPTIONS = ["낮음", "보통", "높음", "긴급"]
+COMPLAINT_CHANNEL_OPTIONS = ["전화", "방문", "모바일", "카카오톡", "이메일", "기타"]
+COMPLAINT_CATEGORY_OPTIONS = ["전기", "기계", "소방", "건축", "청소", "소음", "주차", "안전", "민원", "기타"]
+COMPLAINT_UPDATE_TYPE_OPTIONS = ["내부메모", "상태변경", "회신", "재오픈", "분류", "배정", "완료보고", "만족도"]
+COMPLAINT_RESOLVED_STATUSES = {"처리완료", "회신완료", "종결"}
+COMPLAINT_CLOSED_STATUSES = {"종결", "취소"}
+COMPLAINT_SLA_DAYS = {"긴급": 0, "높음": 1, "보통": 3, "낮음": 5}
+COMPLAINT_REPEAT_WINDOW_DAYS = 90
 
 
 def _parse_int(value, default: int = 0) -> int:
@@ -482,21 +494,156 @@ def _user_options(conn, *, include_viewers: bool = True) -> list[tuple[str, str]
     return [(str(row["id"]), f"{row['full_name']} ({auth.ROLE_LABELS.get(row['role'], row['role'])})") for row in rows]
 
 
+def _complaint_options(conn) -> list[tuple[str, str]]:
+    rows = conn.execute(
+        """
+        SELECT id, complaint_code, title, status
+        FROM complaints
+        ORDER BY CASE WHEN status IN ('종결', '취소') THEN 2 WHEN status = '회신완료' THEN 1 ELSE 0 END,
+                 updated_at DESC, id DESC
+        """
+    ).fetchall()
+    return [(str(row["id"]), f"{row['complaint_code']} · {row['title']} ({row['status']})") for row in rows]
+
+
+def _badge(value: str, tone: str = "neutral") -> str:
+    return f"<span class='badge {esc(tone)}'>{esc(value)}</span>"
+
+
+def _date_value(value: str | None) -> date | None:
+    text = str(value or "").strip()[:10]
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _complaint_due_default(priority: str, *, base_text: str = "") -> str:
+    base_date = _date_value(base_text) or date.today()
+    delta_days = COMPLAINT_SLA_DAYS.get(priority.strip(), COMPLAINT_SLA_DAYS["보통"])
+    return (base_date + timedelta(days=delta_days)).strftime("%Y-%m-%d")
+
+
+def _normalize_complaint_due_date(raw_value: str, priority: str, existing_row=None) -> str:
+    due_text = str(raw_value or "").strip()
+    if due_text:
+        return due_text
+    if existing_row and str(existing_row["response_due_at"] or "").strip():
+        return str(existing_row["response_due_at"]).strip()
+    base_text = existing_row["created_at"] if existing_row else _today_text()
+    return _complaint_due_default(priority, base_text=base_text)
+
+
+def _complaint_sla_meta(row) -> tuple[str, str, str]:
+    due_date = _date_value(row["response_due_at"] if row else "")
+    if not due_date:
+        return "미설정", "warn", "회신 목표일이 아직 없습니다."
+    if row["status"] in {"회신완료", "종결", "취소"}:
+        return "완료", "good", f"회신 목표일 {due_date.strftime('%Y-%m-%d')}"
+
+    today = date.today()
+    remaining_days = (due_date - today).days
+    if remaining_days < 0:
+        return "지연", "danger", f"{abs(remaining_days)}일 초과"
+    if remaining_days == 0:
+        return "오늘 마감", "warn", "오늘 중 회신이 필요합니다."
+    if remaining_days == 1:
+        return "임박", "warn", "1일 남았습니다."
+    return "정상", "good", f"{remaining_days}일 남았습니다."
+
+
+def _complaint_sla_badge(row) -> str:
+    label, tone, _ = _complaint_sla_meta(row)
+    return _badge(label, tone)
+
+
+def _complaint_feedback_badge(rating: int | None) -> str:
+    if not rating:
+        return _badge("미평가", "neutral")
+    tone = "good" if rating >= 4 else "warn" if rating == 3 else "danger"
+    return _badge(f"{rating}점", tone)
+
+
+def _complaint_repeat_candidates(conn, complaint_row, limit: int = 5):
+    if not complaint_row:
+        return []
+
+    where = [
+        "c.id != ?",
+        "c.requester_phone != ''",
+        "c.requester_phone = ?",
+        f"c.created_at >= datetime('now', '-{COMPLAINT_REPEAT_WINDOW_DAYS} days')",
+    ]
+    params: list = [complaint_row["id"], complaint_row["requester_phone"]]
+
+    match_terms = []
+    if complaint_row["facility_id"]:
+        match_terms.append("c.facility_id = ?")
+        params.append(complaint_row["facility_id"])
+    if str(complaint_row["unit_label"] or "").strip():
+        match_terms.append("c.unit_label = ?")
+        params.append(str(complaint_row["unit_label"]).strip())
+    if str(complaint_row["location_detail"] or "").strip():
+        match_terms.append("c.location_detail = ?")
+        params.append(str(complaint_row["location_detail"]).strip())
+    if str(complaint_row["category_primary"] or "").strip():
+        match_terms.append("c.category_primary = ?")
+        params.append(str(complaint_row["category_primary"]).strip())
+
+    if not match_terms:
+        return []
+
+    where.append("(" + " OR ".join(match_terms) + ")")
+    sql = f"""
+        SELECT c.*, f.name AS facility_name, u.full_name AS assignee_name
+        FROM complaints c
+        LEFT JOIN facilities f ON f.id = c.facility_id
+        LEFT JOIN users u ON u.id = c.assignee_user_id
+        WHERE {' AND '.join(where)}
+        ORDER BY c.created_at DESC, c.id DESC
+        LIMIT ?
+    """
+    params.append(limit)
+    return conn.execute(sql, params).fetchall()
+
+
+def _complaint_template_rows(conn, category_primary: str):
+    category = str(category_primary or "").strip()
+    return conn.execute(
+        """
+        SELECT *
+        FROM complaint_response_templates
+        WHERE is_active = 1
+          AND (category_primary = '' OR category_primary = ?)
+        ORDER BY sort_order ASC, name ASC, id ASC
+        """,
+        (category,),
+    ).fetchall()
+
+
 DB_TABLE_LABELS = {
     "users": "사용자",
     "sessions": "세션",
     "facilities": "시설",
     "inventory_items": "재고 항목",
     "inventory_transactions": "재고 수불 이력",
+    "complaints": "민원",
+    "complaint_updates": "민원 업데이트",
+    "complaint_feedback": "민원 만족도",
+    "complaint_response_templates": "민원 회신 템플릿",
     "work_orders": "작업지시",
     "work_order_updates": "작업 업데이트",
     "attachments": "첨부파일",
 }
 DB_MANAGED_TABLES = list(DB_TABLE_LABELS.keys())
-DB_TEXTAREA_COLUMNS = {"note", "body", "description", "reason", "specification"}
+DB_TEXTAREA_COLUMNS = {"note", "body", "description", "reason", "specification", "message"}
 DB_CODE_FIELDS = {
     "facilities": ("facility_code", "FAC"),
     "inventory_items": ("item_code", "INV"),
+    "complaints": ("complaint_code", "CP"),
+    "complaint_response_templates": ("template_code", "CT"),
     "work_orders": ("work_code", "WO"),
 }
 _DB_OMIT = object()
@@ -663,6 +810,104 @@ def _can_delete_work_order(user, row) -> bool:
     if not row:
         return False
     return int(row["created_by"] or 0) == int(user["id"])
+
+
+def _can_manage_complaint(user, row) -> bool:
+    if auth.has_permission(user["role"], "complaints:edit"):
+        return True
+    if not row:
+        return False
+    return int(row["created_by"] or 0) == int(user["id"])
+
+
+def _can_update_complaint(user, row) -> bool:
+    if auth.has_permission(user["role"], "complaints:edit"):
+        return True
+    if not auth.has_permission(user["role"], "complaints:update"):
+        return False
+    if not row:
+        return False
+    return int(row["created_by"] or 0) == int(user["id"]) or int(row["assignee_user_id"] or 0) == int(user["id"])
+
+
+def _can_delete_complaint(user, row) -> bool:
+    if auth.has_permission(user["role"], "complaints:edit"):
+        return True
+    if not row:
+        return False
+    return int(row["created_by"] or 0) == int(user["id"])
+
+
+def _complaint_timestamps(status: str, existing_row=None) -> tuple[str, str]:
+    resolved_at = existing_row["resolved_at"] if existing_row else ""
+    closed_at = existing_row["closed_at"] if existing_row else ""
+
+    if status in COMPLAINT_RESOLVED_STATUSES:
+        if not resolved_at:
+            resolved_at = _now_text()
+    else:
+        resolved_at = ""
+
+    if status in COMPLAINT_CLOSED_STATUSES:
+        if not closed_at:
+            closed_at = _now_text()
+    else:
+        closed_at = ""
+
+    return resolved_at, closed_at
+
+
+def _record_complaint_update(
+    conn,
+    complaint_id: int,
+    update_type: str,
+    message: str,
+    actor_user_id: int | None,
+    *,
+    status_from: str = "",
+    status_to: str = "",
+    is_public_note: int = 0,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO complaint_updates(complaint_id, update_type, status_from, status_to, message, is_public_note, created_by, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (complaint_id, update_type.strip(), status_from.strip(), status_to.strip(), message.strip(), is_public_note, actor_user_id, _now_text()),
+    )
+
+
+def _sync_complaint_for_work_order(conn, complaint_id: int | None, work_order_id: int, work_code: str, actor_user_id: int | None, assignee_user_id: int | None) -> None:
+    if not complaint_id:
+        return
+    complaint = conn.execute("SELECT * FROM complaints WHERE id = ?", (complaint_id,)).fetchone()
+    if not complaint:
+        return
+
+    next_status = complaint["status"]
+    if complaint["status"] in {"접수", "분류완료", "재오픈"}:
+        next_status = "배정완료"
+    resolved_at, closed_at = _complaint_timestamps(next_status, complaint)
+    next_assignee = assignee_user_id or complaint["assignee_user_id"]
+    conn.execute(
+        """
+        UPDATE complaints
+        SET status = ?, assignee_user_id = ?, resolved_at = ?, closed_at = ?, updated_by = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (next_status, next_assignee, resolved_at, closed_at, actor_user_id, _now_text(), complaint_id),
+    )
+    status_from = complaint["status"] if complaint["status"] != next_status else ""
+    status_to = next_status if status_from else ""
+    _record_complaint_update(
+        conn,
+        complaint_id,
+        "작업연결",
+        f"{work_code} 작업지시와 연결되었습니다.",
+        actor_user_id,
+        status_from=status_from,
+        status_to=status_to,
+    )
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -1025,6 +1270,62 @@ def dashboard(request: Request):
     low_stock = conn.execute(
         "SELECT COUNT(*) AS count FROM inventory_items WHERE quantity <= min_quantity"
     ).fetchone()["count"]
+    total_complaints = conn.execute("SELECT COUNT(*) AS count FROM complaints").fetchone()["count"]
+    open_complaints = conn.execute(
+        "SELECT COUNT(*) AS count FROM complaints WHERE status NOT IN ('종결', '취소')"
+    ).fetchone()["count"]
+    overdue_complaints = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM complaints
+        WHERE response_due_at != ''
+          AND response_due_at < ?
+          AND status NOT IN ('회신완료', '종결', '취소')
+        """,
+        (_today_text(),),
+    ).fetchone()["count"]
+    today_received = conn.execute(
+        "SELECT COUNT(*) AS count FROM complaints WHERE created_at LIKE ?",
+        (f"{_today_text()}%",),
+    ).fetchone()["count"]
+    due_today_complaints = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM complaints
+        WHERE response_due_at = ?
+          AND status NOT IN ('회신완료', '종결', '취소')
+        """,
+        (_today_text(),),
+    ).fetchone()["count"]
+    repeat_open_complaints = conn.execute(
+        f"""
+        SELECT COUNT(*) AS count
+        FROM complaints c
+        WHERE c.status NOT IN ('종결', '취소')
+          AND EXISTS (
+            SELECT 1
+            FROM complaints c2
+            WHERE c2.id != c.id
+              AND c.requester_phone != ''
+              AND c2.requester_phone = c.requester_phone
+              AND c2.created_at >= datetime('now', '-{COMPLAINT_REPEAT_WINDOW_DAYS} days')
+              AND (
+                (c.facility_id IS NOT NULL AND c2.facility_id = c.facility_id)
+                OR (c.unit_label != '' AND c2.unit_label = c.unit_label)
+                OR (c.location_detail != '' AND c2.location_detail = c.location_detail)
+                OR (c.category_primary != '' AND c2.category_primary = c.category_primary)
+              )
+          )
+        """
+    ).fetchone()["count"]
+    feedback_stats = conn.execute(
+        """
+        SELECT COUNT(*) AS count,
+               ROUND(AVG(rating), 1) AS avg_rating,
+               SUM(CASE WHEN rating <= 2 THEN 1 ELSE 0 END) AS low_count
+        FROM complaint_feedback
+        """
+    ).fetchone()
     open_work = conn.execute(
         "SELECT COUNT(*) AS count FROM work_orders WHERE status NOT IN ('완료', '종결')"
     ).fetchone()["count"]
@@ -1056,6 +1357,34 @@ def dashboard(request: Request):
         LIMIT 8
         """
     ).fetchall()
+    recent_complaints = conn.execute(
+        """
+        SELECT c.*, f.name AS facility_name, u.full_name AS assignee_name, COUNT(DISTINCT w.id) AS work_count,
+               cf.rating AS feedback_rating,
+               (
+                 SELECT COUNT(*)
+                 FROM complaints c2
+                 WHERE c2.id != c.id
+                   AND c.requester_phone != ''
+                   AND c2.requester_phone = c.requester_phone
+                   AND c2.created_at >= datetime('now', '-90 days')
+                   AND (
+                     (c.facility_id IS NOT NULL AND c2.facility_id = c.facility_id)
+                     OR (c.unit_label != '' AND c2.unit_label = c.unit_label)
+                     OR (c.location_detail != '' AND c2.location_detail = c.location_detail)
+                     OR (c.category_primary != '' AND c2.category_primary = c.category_primary)
+                   )
+               ) AS repeat_count
+        FROM complaints c
+        LEFT JOIN facilities f ON f.id = c.facility_id
+        LEFT JOIN users u ON u.id = c.assignee_user_id
+        LEFT JOIN work_orders w ON w.complaint_id = c.id
+        LEFT JOIN complaint_feedback cf ON cf.complaint_id = c.id
+        GROUP BY c.id
+        ORDER BY c.updated_at DESC, c.id DESC
+        LIMIT 8
+        """
+    ).fetchall()
 
     recent_transactions = conn.execute(
         """
@@ -1073,10 +1402,47 @@ def dashboard(request: Request):
         "<section class='metrics'>"
         + metric_card("시설", total_facilities, f"운영중 {active_facilities}개")
         + metric_card("재고 항목", total_items, f"부족 경고 {low_stock}건")
+        + metric_card("진행 민원", open_complaints, f"회신 지연 {overdue_complaints}건")
+        + metric_card("반복 민원", repeat_open_complaints, f"최근 {COMPLAINT_REPEAT_WINDOW_DAYS}일 기준")
         + metric_card("미완료 작업", open_work, f"지연 {overdue_work}건")
         + metric_card("활성 사용자", active_users, f"오늘 완료 {today_completed}건")
+        + metric_card("오늘 접수", today_received, f"SLA 오늘 마감 {due_today_complaints}건")
+        + metric_card("만족도", feedback_stats["avg_rating"] or "-", f"피드백 {feedback_stats['count']}건 / 저평가 {int(feedback_stats['low_count'] or 0)}건")
         + "</section>"
     )
+
+    if recent_complaints:
+        complaint_rows = "".join(
+            """
+            <tr>
+              <td>{code}</td>
+              <td><strong>{title}</strong><div class='muted'>{requester}</div><div style='margin-top:6px'>{feedback}</div></td>
+              <td>{priority}<div style='margin-top:6px'>{status}</div></td>
+              <td>{assignee}<div style='margin-top:6px'>{repeat_badge}</div></td>
+              <td>{due}<div style='margin-top:6px'>{sla}</div></td>
+            </tr>
+            """.format(
+                code=esc(row["complaint_code"]),
+                title=esc(row["title"]),
+                requester=esc(f"{row['requester_name'] or '-'} / {row['unit_label'] or row['location_detail'] or '-'}"),
+                feedback=_complaint_feedback_badge(row["feedback_rating"]) if row["feedback_rating"] else _badge("미평가", "neutral"),
+                priority=status_badge(row["priority"]),
+                status=status_badge(row["status"]),
+                assignee=esc(row["assignee_name"] or "미배정"),
+                due=esc(fmt_date(row["response_due_at"])),
+                repeat_badge=_badge(f"반복 {row['repeat_count']}건", "danger") if int(row["repeat_count"] or 0) else _badge("반복 없음", "good"),
+                sla=_complaint_sla_badge(row),
+            )
+            for row in recent_complaints
+        )
+        complaint_table = (
+            "<section class='panel'><div class='split'><h2>최근 민원</h2>"
+            "<a class='btn secondary' href='/complaints'>전체 보기</a></div>"
+            "<table><thead><tr><th>번호</th><th>민원</th><th>우선도/상태</th><th>담당</th><th>회신 목표일</th></tr></thead>"
+            f"<tbody>{complaint_rows}</tbody></table></section>"
+        )
+    else:
+        complaint_table = "<section class='panel'><h2>최근 민원</h2>" + empty_state("등록된 민원이 없습니다.") + "</section>"
 
     if recent_work_orders:
         work_rows = "".join(
@@ -1155,7 +1521,7 @@ def dashboard(request: Request):
         + "<div class='stack'>"
         + info_box(
             "운영 원칙",
-            "시설 상태는 위치 중심으로, 재고는 수불 이력 중심으로, 작업지시는 조치 내역 중심으로 관리합니다.",
+            "시설 상태는 위치 중심으로, 민원은 접수와 회신 기준으로, 작업지시는 조치 내역 중심으로 관리합니다.",
         )
         + info_box(
             "초기 계정",
@@ -1163,6 +1529,7 @@ def dashboard(request: Request):
         )
         + "</div>"
         + "<div class='stack'>"
+        + complaint_table
         + work_table
         + tx_table
         + "</div></div>"
@@ -1793,13 +2160,14 @@ def work_orders_page(request: Request):
     status = request.query_params.get("status", "").strip()
     priority = request.query_params.get("priority", "").strip()
     edit_id = _parse_int(request.query_params.get("edit", ""), 0)
+    complaint_prefill_id = _parse_int(request.query_params.get("complaint_id", ""), 0) if not edit_id else 0
 
     conn = get_conn()
     where = []
     params: list = []
     if q:
-        where.append("(w.work_code LIKE ? OR w.title LIKE ? OR w.description LIKE ? OR w.requester_name LIKE ?)")
-        params.extend([f"%{q}%"] * 4)
+        where.append("(w.work_code LIKE ? OR w.title LIKE ? OR w.description LIKE ? OR w.requester_name LIKE ? OR c.complaint_code LIKE ? OR c.title LIKE ?)")
+        params.extend([f"%{q}%"] * 6)
     if status:
         where.append("w.status = ?")
         params.append(status)
@@ -1810,10 +2178,11 @@ def work_orders_page(request: Request):
 
     orders = conn.execute(
         f"""
-        SELECT w.*, f.name AS facility_name, u.full_name AS assignee_name
+        SELECT w.*, f.name AS facility_name, u.full_name AS assignee_name, c.complaint_code, c.title AS complaint_title
         FROM work_orders w
         LEFT JOIN facilities f ON f.id = w.facility_id
         LEFT JOIN users u ON u.id = w.assignee_user_id
+        LEFT JOIN complaints c ON c.id = w.complaint_id
         {where_sql}
         ORDER BY CASE w.priority WHEN '긴급' THEN 1 WHEN '높음' THEN 2 WHEN '보통' THEN 3 ELSE 4 END,
                  w.updated_at DESC, w.id DESC
@@ -1822,6 +2191,11 @@ def work_orders_page(request: Request):
     ).fetchall()
     attachments = _attachment_map(conn, "work_order", [row["id"] for row in orders])
     edit_row = conn.execute("SELECT * FROM work_orders WHERE id = ?", (edit_id,)).fetchone() if edit_id else None
+    complaint_prefill = (
+        conn.execute("SELECT * FROM complaints WHERE id = ?", (complaint_prefill_id,)).fetchone()
+        if complaint_prefill_id
+        else None
+    )
     updates = (
         conn.execute(
             """
@@ -1839,6 +2213,7 @@ def work_orders_page(request: Request):
     )
     facility_options = _facility_options(conn)
     assignee_options = _user_options(conn, include_viewers=False)
+    complaint_options = _complaint_options(conn)
     conn.close()
 
     can_manage_edit_row = _can_manage_work_order(user, edit_row)
@@ -1872,19 +2247,25 @@ def work_orders_page(request: Request):
                     if edit_row
                     else ""
                 )
+                + f"<div><label>연결 민원</label><select name='complaint_id'>{render_options(complaint_options, str(edit_row['complaint_id'] or '') if edit_row else str(complaint_prefill['id']) if complaint_prefill else '', blank_label='미연결')}</select></div>"
+                + (
+                    f"<div class='muted' style='padding:8px 0 2px;'>민원 프리필: {esc(complaint_prefill['complaint_code'])} 민원에서 제목, 시설, 요청자, 우선도가 기본값으로 채워졌습니다.</div>"
+                    if complaint_prefill and not edit_row
+                    else ""
+                )
                 + f"<div><label>분류</label><select name='category'>{render_options(category_options, edit_row['category'] if edit_row else '', blank_label='선택')}</select></div>"
-                + f"<div><label>작업 제목</label><input name='title' value='{esc(edit_row['title'] if edit_row else '')}' required></div>"
-                + f"<div><label>대상 시설</label><select name='facility_id'>{render_options(facility_options, str(edit_row['facility_id'] or '') if edit_row else '', blank_label='미지정')}</select></div>"
+                + f"<div><label>작업 제목</label><input name='title' value='{esc(edit_row['title'] if edit_row else complaint_prefill['title'] if complaint_prefill else '')}' required></div>"
+                + f"<div><label>대상 시설</label><select name='facility_id'>{render_options(facility_options, str(edit_row['facility_id'] or '') if edit_row else str(complaint_prefill['facility_id'] or '') if complaint_prefill else '', blank_label='미지정')}</select></div>"
                 + "<div class='grid two'>"
-                + f"<div><label>요청자</label><input name='requester_name' value='{esc(edit_row['requester_name'] if edit_row else '')}'></div>"
-                + f"<div><label>담당자</label><select name='assignee_user_id'>{render_options(assignee_options, str(edit_row['assignee_user_id'] or '') if edit_row else '', blank_label='미지정')}</select></div>"
+                + f"<div><label>요청자</label><input name='requester_name' value='{esc(edit_row['requester_name'] if edit_row else complaint_prefill['requester_name'] if complaint_prefill else '')}'></div>"
+                + f"<div><label>담당자</label><select name='assignee_user_id'>{render_options(assignee_options, str(edit_row['assignee_user_id'] or '') if edit_row else str(complaint_prefill['assignee_user_id'] or '') if complaint_prefill else '', blank_label='미지정')}</select></div>"
                 + "</div>"
                 + "<div class='grid two'>"
-                + f"<div><label>우선도</label><select name='priority'>{render_options(priority_options, edit_row['priority'] if edit_row else '보통')}</select></div>"
+                + f"<div><label>우선도</label><select name='priority'>{render_options(priority_options, edit_row['priority'] if edit_row else complaint_prefill['priority'] if complaint_prefill else '보통')}</select></div>"
                 + f"<div><label>상태</label><select name='status'>{render_options(status_options, edit_row['status'] if edit_row else '접수')}</select></div>"
                 + "</div>"
                 + f"<div><label>기한</label><input name='due_date' type='date' value='{esc(fmt_date(edit_row['due_date']) if edit_row else '')}'></div>"
-                + f"<div><label>작업 내용</label><textarea name='description'>{esc(edit_row['description'] if edit_row else '')}</textarea></div>"
+                + f"<div><label>작업 내용</label><textarea name='description'>{esc(edit_row['description'] if edit_row else complaint_prefill['description'] if complaint_prefill else '')}</textarea></div>"
                 + "<div><label>현장 사진 / 첨부</label><input name='files' type='file' accept='image/*' multiple></div>"
                 + "<div class='row-actions'>"
                 + "<button class='btn primary' type='submit'>저장</button>"
@@ -1956,7 +2337,7 @@ def work_orders_page(request: Request):
                 """
                 <tr>
                   <td>{code}</td>
-                  <td><strong>{title}</strong><div class='muted'>{category}</div><div class='muted'>{description}</div></td>
+                  <td><strong>{title}</strong><div class='muted'>{category}</div><div class='muted'>{complaint}</div><div class='muted'>{description}</div></td>
                   <td>{facility}</td>
                   <td>{priority}<div style='margin-top:6px'>{status}</div></td>
                   <td>{assignee}<div class='muted'>기한 {due}</div><div style='margin-top:6px'>{due_badge}</div></td>
@@ -1967,6 +2348,7 @@ def work_orders_page(request: Request):
                     code=esc(row["work_code"]),
                     title=esc(row["title"]),
                     category=esc(row["category"] or "-"),
+                    complaint=esc(f"민원 {row['complaint_code']} · {row['complaint_title']}" if row["complaint_code"] else "민원 미연결"),
                     description=esc((row["description"] or "")[:80] + ("..." if len(row["description"] or "") > 80 else "")),
                     facility=esc(row["facility_name"] or "시설 미지정"),
                     priority=status_badge(row["priority"]),
@@ -2011,6 +2393,7 @@ def work_orders_page(request: Request):
 def work_orders_save(
     request: Request,
     work_order_id: str = Form(""),
+    complaint_id: str = Form(""),
     category: str = Form(""),
     title: str = Form(...),
     facility_id: str = Form(""),
@@ -2027,6 +2410,7 @@ def work_orders_save(
         return error
 
     work_order_id_i = _parse_int(work_order_id, 0)
+    complaint_id_i = _parse_int(complaint_id, 0) or None
     facility_id_i = _parse_int(facility_id, 0) or None
     assignee_id_i = _parse_int(assignee_user_id, 0) or None
     completed_at = _now_text() if status in {"완료", "종결"} else ""
@@ -2043,11 +2427,12 @@ def work_orders_save(
         conn.execute(
             """
             UPDATE work_orders
-            SET category = ?, title = ?, facility_id = ?, requester_name = ?, priority = ?, status = ?, description = ?,
+            SET complaint_id = ?, category = ?, title = ?, facility_id = ?, requester_name = ?, priority = ?, status = ?, description = ?,
                 assignee_user_id = ?, due_date = ?, completed_at = ?, updated_by = ?, updated_at = ?
             WHERE id = ?
             """,
             (
+                complaint_id_i,
                 category.strip(),
                 title.strip(),
                 facility_id_i,
@@ -2070,6 +2455,7 @@ def work_orders_save(
             """,
             (work_order_id_i, "작업지시 기본정보 수정", user["id"], _now_text()),
         )
+        _sync_complaint_for_work_order(conn, complaint_id_i, work_order_id_i, existing["work_code"], user["id"], assignee_id_i)
         _save_attachments(conn, "work_order", work_order_id_i, files, user["id"])
         conn.commit()
         conn.close()
@@ -2082,12 +2468,13 @@ def work_orders_save(
     cursor = conn.execute(
         """
         INSERT INTO work_orders(
-            work_code, category, title, facility_id, requester_name, priority, status, description,
+            work_code, complaint_id, category, title, facility_id, requester_name, priority, status, description,
             assignee_user_id, due_date, completed_at, created_by, updated_by, created_at, updated_at
         )
-        VALUES ('', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES ('', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            complaint_id_i,
             category.strip(),
             title.strip(),
             facility_id_i,
@@ -2105,7 +2492,8 @@ def work_orders_save(
         ),
     )
     work_order_id_i = cursor.lastrowid
-    conn.execute("UPDATE work_orders SET work_code = ? WHERE id = ?", (f"WO-{work_order_id_i:04d}", work_order_id_i))
+    work_code = f"WO-{work_order_id_i:04d}"
+    conn.execute("UPDATE work_orders SET work_code = ? WHERE id = ?", (work_code, work_order_id_i))
     conn.execute(
         """
         INSERT INTO work_order_updates(work_order_id, update_type, body, actor_user_id, created_at)
@@ -2113,6 +2501,7 @@ def work_orders_save(
         """,
         (work_order_id_i, "작업지시가 생성되었습니다.", user["id"], _now_text()),
     )
+    _sync_complaint_for_work_order(conn, complaint_id_i, work_order_id_i, work_code, user["id"], assignee_id_i)
     _save_attachments(conn, "work_order", work_order_id_i, files, user["id"])
     conn.commit()
     conn.close()
@@ -2190,6 +2579,763 @@ def work_orders_delete(request: Request, work_order_id: int):
     return _with_flash("/work-orders", "작업지시가 삭제되었습니다.", "ok")
 
 
+@app.get("/complaints", response_class=HTMLResponse)
+def complaints_page(request: Request):
+    user, error = _authorize(request, "complaints:view")
+    if error:
+        return error
+
+    can_create = auth.has_permission(user["role"], "complaints:create")
+    q = request.query_params.get("q", "").strip()
+    status = request.query_params.get("status", "").strip()
+    channel = request.query_params.get("channel", "").strip()
+    priority = request.query_params.get("priority", "").strip()
+    edit_id = _parse_int(request.query_params.get("edit", ""), 0)
+
+    conn = get_conn()
+    where = []
+    params: list = []
+    if q:
+        where.append(
+            "(c.complaint_code LIKE ? OR c.title LIKE ? OR c.description LIKE ? OR c.requester_name LIKE ? OR c.requester_phone LIKE ? OR c.unit_label LIKE ? OR c.location_detail LIKE ?)"
+        )
+        params.extend([f"%{q}%"] * 7)
+    if status:
+        where.append("c.status = ?")
+        params.append(status)
+    if channel:
+        where.append("c.channel = ?")
+        params.append(channel)
+    if priority:
+        where.append("c.priority = ?")
+        params.append(priority)
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+
+    complaints = conn.execute(
+        f"""
+        SELECT c.*, f.name AS facility_name, u.full_name AS assignee_name, COUNT(DISTINCT w.id) AS work_count,
+               cf.rating AS feedback_rating, cf.follow_up_at AS feedback_follow_up_at,
+               (
+                 SELECT COUNT(*)
+                 FROM complaints c2
+                 WHERE c2.id != c.id
+                   AND c.requester_phone != ''
+                   AND c2.requester_phone = c.requester_phone
+                   AND c2.created_at >= datetime('now', '-{COMPLAINT_REPEAT_WINDOW_DAYS} days')
+                   AND (
+                     (c.facility_id IS NOT NULL AND c2.facility_id = c.facility_id)
+                     OR (c.unit_label != '' AND c2.unit_label = c.unit_label)
+                     OR (c.location_detail != '' AND c2.location_detail = c.location_detail)
+                     OR (c.category_primary != '' AND c2.category_primary = c.category_primary)
+                   )
+               ) AS repeat_count
+        FROM complaints c
+        LEFT JOIN facilities f ON f.id = c.facility_id
+        LEFT JOIN users u ON u.id = c.assignee_user_id
+        LEFT JOIN work_orders w ON w.complaint_id = c.id
+        LEFT JOIN complaint_feedback cf ON cf.complaint_id = c.id
+        {where_sql}
+        GROUP BY c.id
+        ORDER BY CASE c.priority WHEN '긴급' THEN 1 WHEN '높음' THEN 2 WHEN '보통' THEN 3 ELSE 4 END,
+                 c.updated_at DESC, c.id DESC
+        """,
+        params,
+    ).fetchall()
+    attachments = _attachment_map(conn, "complaint", [row["id"] for row in complaints])
+    edit_row = (
+        conn.execute(
+            """
+            SELECT c.*, f.name AS facility_name, u.full_name AS assignee_name,
+                   cf.id AS feedback_id, cf.rating AS feedback_rating, cf.comment AS feedback_comment, cf.follow_up_at
+            FROM complaints c
+            LEFT JOIN facilities f ON f.id = c.facility_id
+            LEFT JOIN users u ON u.id = c.assignee_user_id
+            LEFT JOIN complaint_feedback cf ON cf.complaint_id = c.id
+            WHERE c.id = ?
+            """,
+            (edit_id,),
+        ).fetchone()
+        if edit_id
+        else None
+    )
+    updates = (
+        conn.execute(
+            """
+            SELECT cu.*, us.full_name AS actor_name
+            FROM complaint_updates cu
+            LEFT JOIN users us ON us.id = cu.created_by
+            WHERE cu.complaint_id = ?
+            ORDER BY cu.created_at DESC, cu.id DESC
+            LIMIT 20
+            """,
+            (edit_id,),
+        ).fetchall()
+        if edit_id
+        else []
+    )
+    feedback_row = (
+        conn.execute(
+            """
+            SELECT cf.*, cu.full_name AS created_by_name, uu.full_name AS updated_by_name
+            FROM complaint_feedback cf
+            LEFT JOIN users cu ON cu.id = cf.created_by
+            LEFT JOIN users uu ON uu.id = cf.updated_by
+            WHERE cf.complaint_id = ?
+            """,
+            (edit_id,),
+        ).fetchone()
+        if edit_id
+        else None
+    )
+    linked_work_orders = (
+        conn.execute(
+            """
+            SELECT w.*, f.name AS facility_name, u.full_name AS assignee_name
+            FROM work_orders w
+            LEFT JOIN facilities f ON f.id = w.facility_id
+            LEFT JOIN users u ON u.id = w.assignee_user_id
+            WHERE w.complaint_id = ?
+            ORDER BY w.updated_at DESC, w.id DESC
+            """,
+            (edit_id,),
+        ).fetchall()
+        if edit_id
+        else []
+    )
+    repeat_rows = _complaint_repeat_candidates(conn, edit_row, limit=6) if edit_row else []
+    template_rows = _complaint_template_rows(conn, edit_row["category_primary"] if edit_row else "")
+    facility_options = _facility_options(conn)
+    assignee_options = _user_options(conn, include_viewers=False)
+    conn.close()
+
+    can_manage_edit_row = _can_manage_complaint(user, edit_row)
+    can_update_edit_row = _can_update_complaint(user, edit_row)
+    can_delete_edit_row = _can_delete_complaint(user, edit_row)
+
+    signal_html = ""
+    if edit_row:
+        sla_label, sla_tone, sla_note = _complaint_sla_meta(edit_row)
+        repeat_note = (
+            f"최근 {COMPLAINT_REPEAT_WINDOW_DAYS}일 내 유사 민원 {len(repeat_rows)}건"
+            if repeat_rows
+            else f"최근 {COMPLAINT_REPEAT_WINDOW_DAYS}일 내 반복 민원이 없습니다."
+        )
+        feedback_note = (
+            f"{feedback_row['rating']}점 / {fmt_date(feedback_row['follow_up_at'])} 확인"
+            if feedback_row
+            else "만족도 기록이 아직 없습니다."
+        )
+        signal_html = (
+            "<div class='grid two' style='margin:14px 0;'>"
+            + "<div style='border:1px solid rgba(23,33,43,0.08); border-radius:18px; padding:14px; background:#fff;'>"
+            + "<label>SLA 신호</label>"
+            + f"<div>{_badge(sla_label, sla_tone)}</div><div class='muted' style='margin-top:8px'>{esc(sla_note)}</div>"
+            + "</div>"
+            + "<div style='border:1px solid rgba(23,33,43,0.08); border-radius:18px; padding:14px; background:#fff;'>"
+            + "<label>반복 / 만족도</label>"
+            + f"<div>{_badge(f'반복 {len(repeat_rows)}건' if repeat_rows else '반복 없음', 'danger' if repeat_rows else 'good')} {_complaint_feedback_badge(feedback_row['rating'] if feedback_row else None)}</div>"
+            + f"<div class='muted' style='margin-top:8px'>{esc(repeat_note)} / {esc(feedback_note)}</div>"
+            + "</div></div>"
+        )
+
+    form_html = ""
+    if can_create or edit_row:
+        if edit_row and not (can_manage_edit_row or can_update_edit_row):
+            form_html = signal_html + info_box("권한 제한", "이 민원은 본인 접수 건이나 본인 배정 건일 때만 수정 또는 업데이트할 수 있습니다.")
+        elif edit_row and not can_manage_edit_row:
+            form_html = (
+                "<section class='panel'><h2>민원 상세</h2><p class='muted'>기본정보 수정 권한은 없고, 진행 업데이트만 가능합니다.</p>"
+                + signal_html
+                + "<div class='stack'>"
+                + info_box("민원 번호", esc(edit_row["complaint_code"]))
+                + info_box("민원 제목", esc(edit_row["title"]))
+                + info_box("민원 내용", esc(edit_row["description"] or "-"))
+                + info_box("민원인", esc(edit_row["requester_name"] or "-"))
+                + "</div>"
+            )
+        else:
+            form_html = (
+                "<section class='panel'><h2>민원 등록 / 수정</h2><p class='muted'>민원 접수, 분류, 배정, 회신 이력을 접수 기준으로 관리합니다.</p>"
+                + signal_html
+                + "<form action='/complaints/save' method='post' enctype='multipart/form-data' class='stack'>"
+                + f"<input type='hidden' name='complaint_id' value='{esc(edit_row['id'] if edit_row else '')}'>"
+                + (
+                    f"<div><label>민원 번호</label><input value='{esc(edit_row['complaint_code'])}' disabled></div>"
+                    if edit_row
+                    else ""
+                )
+                + "<div class='grid two'>"
+                + f"<div><label>접수 채널</label><select name='channel'>{render_options(COMPLAINT_CHANNEL_OPTIONS, edit_row['channel'] if edit_row else '전화')}</select></div>"
+                + f"<div><label>대상 시설</label><select name='facility_id'>{render_options(facility_options, str(edit_row['facility_id'] or '') if edit_row else '', blank_label='미지정')}</select></div>"
+                + "</div>"
+                + "<div class='grid two'>"
+                + f"<div><label>1차 분류</label><select name='category_primary'>{render_options(COMPLAINT_CATEGORY_OPTIONS, edit_row['category_primary'] if edit_row else '', blank_label='선택')}</select></div>"
+                + f"<div><label>2차 분류</label><input name='category_secondary' value='{esc(edit_row['category_secondary'] if edit_row else '')}' placeholder='세부 유형'></div>"
+                + "</div>"
+                + f"<div><label>민원 제목</label><input name='title' value='{esc(edit_row['title'] if edit_row else '')}' required></div>"
+                + "<div class='grid two'>"
+                + f"<div><label>동/호 또는 위치</label><input name='unit_label' value='{esc(edit_row['unit_label'] if edit_row else '')}' placeholder='예: 101동 1203호'></div>"
+                + f"<div><label>세부 위치</label><input name='location_detail' value='{esc(edit_row['location_detail'] if edit_row else '')}' placeholder='예: 주방 천장'></div>"
+                + "</div>"
+                + "<div class='grid two'>"
+                + f"<div><label>민원인</label><input name='requester_name' value='{esc(edit_row['requester_name'] if edit_row else '')}'></div>"
+                + f"<div><label>연락처</label><input name='requester_phone' value='{esc(edit_row['requester_phone'] if edit_row else '')}' inputmode='tel' placeholder='01012345678'></div>"
+                + "</div>"
+                + "<div class='grid two'>"
+                + f"<div><label>이메일</label><input name='requester_email' type='email' value='{esc(edit_row['requester_email'] if edit_row else '')}'></div>"
+                + f"<div><label>담당자</label><select name='assignee_user_id'>{render_options(assignee_options, str(edit_row['assignee_user_id'] or '') if edit_row else '', blank_label='미지정')}</select></div>"
+                + "</div>"
+                + "<div class='grid two'>"
+                + f"<div><label>우선도</label><select name='priority'>{render_options(COMPLAINT_PRIORITY_OPTIONS, edit_row['priority'] if edit_row else '보통')}</select></div>"
+                + f"<div><label>상태</label><select name='status'>{render_options(COMPLAINT_STATUS_OPTIONS, edit_row['status'] if edit_row else '접수')}</select></div>"
+                + "</div>"
+                + f"<div><label>회신 목표일</label><input name='response_due_at' type='date' value='{esc(fmt_date(edit_row['response_due_at']) if edit_row else _complaint_due_default('보통'))}'><div class='muted'>비워 두면 우선도 기준 SLA({', '.join(f'{k} {v}일' for k, v in COMPLAINT_SLA_DAYS.items())})로 자동 계산됩니다.</div></div>"
+                + f"<div><label>민원 내용</label><textarea name='description'>{esc(edit_row['description'] if edit_row else '')}</textarea></div>"
+                + "<div><label>사진 / 첨부</label><input name='files' type='file' accept='image/*' multiple></div>"
+                + "<div class='row-actions'>"
+                + "<button class='btn primary' type='submit'>저장</button>"
+                + "<a class='btn secondary' href='/complaints'>새로 입력</a>"
+                + (
+                    f"<a class='btn secondary' href='/work-orders?complaint_id={edit_row['id']}'>작업지시 생성</a>"
+                    if edit_row and auth.has_permission(user["role"], "work_orders:create")
+                    else ""
+                )
+                + (
+                    _post_action_button(f"/complaints/delete/{edit_row['id']}", "삭제", "민원을 삭제하시겠습니까?")
+                    if edit_row and can_delete_edit_row
+                    else ""
+                )
+                + "</div></form>"
+            )
+
+        if edit_row and (can_manage_edit_row or can_update_edit_row):
+            form_html += "<div style='margin-top:14px'><label>현재 첨부</label>" + attachment_gallery(attachments.get(edit_row["id"], [])) + "</div>"
+
+        if edit_row:
+            linked_work_html = (
+                "".join(
+                    """
+                    <tr>
+                      <td>{code}</td>
+                      <td><strong>{title}</strong><div class='muted'>{facility}</div></td>
+                      <td>{status}</td>
+                      <td>{assignee}</td>
+                      <td><a class='btn secondary' href='/work-orders?edit={work_id}'>열기</a></td>
+                    </tr>
+                    """.format(
+                        code=esc(row["work_code"]),
+                        title=esc(row["title"]),
+                        facility=esc(row["facility_name"] or "시설 미지정"),
+                        status=status_badge(row["status"]),
+                        assignee=esc(row["assignee_name"] or "미배정"),
+                        work_id=row["id"],
+                    )
+                    for row in linked_work_orders
+                )
+                if linked_work_orders
+                else "<tr><td colspan='5' class='muted'>연결된 작업지시가 없습니다.</td></tr>"
+            )
+            form_html += (
+                "<div class='panel' style='margin-top:16px; padding:0; border:none; box-shadow:none;'>"
+                "<div class='split'><h3>연결된 작업지시</h3>"
+                + (
+                    f"<a class='btn secondary' href='/work-orders?complaint_id={edit_row['id']}'>작업지시 생성</a>"
+                    if auth.has_permission(user["role"], "work_orders:create")
+                    else ""
+                )
+                + "</div>"
+                + "<table><thead><tr><th>번호</th><th>작업</th><th>상태</th><th>담당</th><th>관리</th></tr></thead>"
+                + f"<tbody>{linked_work_html}</tbody></table></div>"
+            )
+
+            repeat_rows_html = (
+                "".join(
+                    """
+                    <tr>
+                      <td>{code}</td>
+                      <td><strong>{title}</strong><div class='muted'>{requester}</div></td>
+                      <td>{location}<div class='muted'>{facility}</div></td>
+                      <td>{status}</td>
+                      <td><a class='btn secondary' href='/complaints?edit={complaint_id}'>열기</a></td>
+                    </tr>
+                    """.format(
+                        code=esc(row["complaint_code"]),
+                        title=esc(row["title"]),
+                        requester=esc(f"{row['requester_name'] or '-'} / {row['requester_phone'] or '-'}"),
+                        location=esc(row["unit_label"] or row["location_detail"] or "-"),
+                        facility=esc(row["facility_name"] or "시설 미지정"),
+                        status=status_badge(row["status"]),
+                        complaint_id=row["id"],
+                    )
+                    for row in repeat_rows
+                )
+                if repeat_rows
+                else f"<tr><td colspan='5' class='muted'>최근 {COMPLAINT_REPEAT_WINDOW_DAYS}일 내 반복 민원이 감지되지 않았습니다.</td></tr>"
+            )
+            form_html += (
+                "<div class='panel' style='margin-top:16px; padding:0; border:none; box-shadow:none;'>"
+                f"<h3>반복 민원 감지</h3><p class='muted'>같은 연락처 기준 최근 {COMPLAINT_REPEAT_WINDOW_DAYS}일 내 유사 민원을 보여 줍니다.</p>"
+                + "<table><thead><tr><th>번호</th><th>민원</th><th>위치</th><th>상태</th><th>관리</th></tr></thead>"
+                + f"<tbody>{repeat_rows_html}</tbody></table></div>"
+            )
+
+        if edit_row and can_update_edit_row:
+            template_options = "".join(
+                f"<option value='{row['id']}'>{esc(row['name'])} ({esc(row['category_primary'] or '공통')})</option>"
+                for row in template_rows
+            )
+            template_payload = json.dumps(
+                {
+                    str(row["id"]): {
+                        "body": row["body"],
+                        "update_type": row["update_type"],
+                        "status_to": row["status_to"],
+                        "is_public_note": int(row["is_public_note"] or 0),
+                    }
+                    for row in template_rows
+                },
+                ensure_ascii=False,
+            ).replace("</", "<\\/")
+            updates_html = (
+                "".join(
+                    """
+                    <tr>
+                      <td>{when}</td>
+                      <td>{type}</td>
+                      <td>{status_move}</td>
+                      <td>{public_note}</td>
+                      <td>{body}</td>
+                      <td>{actor}</td>
+                    </tr>
+                    """.format(
+                        when=esc(fmt_datetime(row["created_at"])),
+                        type=status_badge(row["update_type"]),
+                        status_move=esc(f"{row['status_from'] or '-'} -> {row['status_to'] or '-'}"),
+                        public_note=status_badge("회신" if row["is_public_note"] else "내부"),
+                        body=esc(row["message"]),
+                        actor=esc(row["actor_name"] or "system"),
+                    )
+                    for row in updates
+                )
+                if updates
+                else "<tr><td colspan='6' class='muted'>민원 이력이 없습니다.</td></tr>"
+            )
+            feedback_summary_html = (
+                "<div class='muted'>조치 후 확인된 만족도를 기록합니다. 4점 이상은 만족, 2점 이하는 불만족 신호로 집계합니다.</div>"
+                + (
+                    f"<div style='margin-top:10px'>{_complaint_feedback_badge(feedback_row['rating'])} <span class='muted'>후속 연락 {esc(fmt_date(feedback_row['follow_up_at']))} / 최종 수정 {esc(feedback_row['updated_by_name'] or feedback_row['created_by_name'] or 'system')}</span></div>"
+                    if feedback_row
+                    else "<div style='margin-top:10px' class='muted'>기록된 만족도가 없습니다.</div>"
+                )
+            )
+            form_html += (
+                "<div class='panel' style='margin-top:16px; padding:0; border:none; box-shadow:none;'>"
+                "<h3>민원 업데이트</h3><p class='muted'>회신, 상태변경, 재오픈, 내부 메모를 민원 기준으로 남깁니다.</p>"
+                f"<form action='/complaints/update/{edit_row['id']}' method='post' enctype='multipart/form-data' class='stack'>"
+                + (
+                    "<div class='grid two'>"
+                    + f"<div><label>회신 템플릿</label><select id='complaint-template-select'><option value=''>선택</option>{template_options}</select><div class='muted'>공통 템플릿과 현재 분류용 템플릿만 보입니다.</div></div>"
+                    + "<div style='display:flex; align-items:flex-end;'><button class='btn secondary' id='complaint-template-apply' type='button'>템플릿 적용</button></div>"
+                    + "</div>"
+                    if template_rows
+                    else ""
+                )
+                + "<div class='grid two'>"
+                + f"<div><label>업데이트 유형</label><select id='complaint-update-type' name='update_type'>{render_options(COMPLAINT_UPDATE_TYPE_OPTIONS, '내부메모')}</select></div>"
+                + f"<div><label>새 상태</label><select id='complaint-update-status' name='status'>{render_options(COMPLAINT_STATUS_OPTIONS, edit_row['status'], blank_label='상태 유지')}</select></div>"
+                + "</div>"
+                + "<label style='display:flex;align-items:center;gap:8px;'><input id='complaint-update-public' name='is_public_note' type='checkbox' value='1' style='width:auto;'>민원인 회신용 메모로 표시</label>"
+                + "<div><label>업데이트 내용</label><textarea id='complaint-update-message' name='message' required></textarea></div>"
+                + "<div><label>추가 첨부</label><input name='files' type='file' accept='image/*' multiple></div>"
+                + "<div class='row-actions'><button class='btn warn' type='submit'>업데이트 저장</button></div>"
+                + "</form>"
+                + "<div style='margin-top:14px'><h3>최근 민원 이력</h3>"
+                + "<table><thead><tr><th>시각</th><th>유형</th><th>상태변경</th><th>구분</th><th>내용</th><th>작성자</th></tr></thead>"
+                + f"<tbody>{updates_html}</tbody></table></div></div>"
+                + (
+                    "<script>"
+                    "(function(){"
+                    "const templates = " + template_payload + ";"
+                    "const select = document.getElementById('complaint-template-select');"
+                    "const applyButton = document.getElementById('complaint-template-apply');"
+                    "if(!select || !applyButton){return;}"
+                    "applyButton.addEventListener('click', function(){"
+                    "const selected = templates[select.value];"
+                    "if(!selected){return;}"
+                    "const message = document.getElementById('complaint-update-message');"
+                    "const updateType = document.getElementById('complaint-update-type');"
+                    "const statusField = document.getElementById('complaint-update-status');"
+                    "const publicField = document.getElementById('complaint-update-public');"
+                    "if(message){message.value = message.value.trim() ? message.value.trim() + '\\n\\n' + selected.body : selected.body;}"
+                    "if(updateType && selected.update_type){updateType.value = selected.update_type;}"
+                    "if(statusField && selected.status_to){statusField.value = selected.status_to;}"
+                    "if(publicField){publicField.checked = !!selected.is_public_note;}"
+                    "});"
+                    "})();"
+                    "</script>"
+                    if template_rows
+                    else ""
+                )
+                + "<div class='panel' style='margin-top:16px; padding:0; border:none; box-shadow:none;'>"
+                + "<h3>만족도 기록</h3>"
+                + feedback_summary_html
+                + f"<form action='/complaints/feedback/{edit_row['id']}' method='post' class='stack' style='margin-top:12px;'>"
+                + "<div class='grid two'>"
+                + f"<div><label>만족도</label><select name='rating'>{render_options([('5', '5점 매우 만족'), ('4', '4점 만족'), ('3', '3점 보통'), ('2', '2점 불만'), ('1', '1점 매우 불만')], str(feedback_row['rating']) if feedback_row else '4')}</select></div>"
+                + f"<div><label>후속 연락일</label><input name='follow_up_at' type='date' value='{esc(fmt_date(feedback_row['follow_up_at']) if feedback_row else _today_text())}'></div>"
+                + "</div>"
+                + f"<div><label>코멘트</label><textarea name='comment'>{esc(feedback_row['comment'] if feedback_row else '')}</textarea></div>"
+                + "<div class='row-actions'><button class='btn secondary' type='submit'>만족도 저장</button></div>"
+                + "</form></div>"
+            )
+        form_html += "</section>"
+    else:
+        form_html = info_box("읽기 전용", "현재 계정은 민원 조회만 가능합니다. 등록과 수정은 작업자 이상 권한이 필요합니다.")
+
+    if complaints:
+        rows_html = []
+        for row in complaints:
+            due_text = fmt_date(row["response_due_at"])
+            row_actions = []
+            if _can_manage_complaint(user, row):
+                row_actions.append(f"<a class='btn secondary' href='/complaints?edit={row['id']}'>수정</a>")
+            elif _can_update_complaint(user, row):
+                row_actions.append(f"<a class='btn secondary' href='/complaints?edit={row['id']}'>업데이트</a>")
+            else:
+                row_actions.append("<span class='muted'>조회</span>")
+            repeat_badge = _badge(f"반복 {row['repeat_count']}건", "danger") if int(row["repeat_count"] or 0) else ""
+            feedback_badge = _complaint_feedback_badge(row["feedback_rating"]) if row["feedback_rating"] else ""
+            rows_html.append(
+                """
+                <tr>
+                  <td>{code}</td>
+                  <td><strong>{title}</strong><div class='muted'>{channel} · {category}</div><div class='muted'>{requester}</div></td>
+                  <td>{location}<div class='muted'>{facility}</div></td>
+                  <td>{priority}<div style='margin-top:6px'>{status}</div><div style='margin-top:6px'>{sla}</div></td>
+                  <td>{assignee}<div class='muted'>회신 목표 {due}</div><div style='margin-top:6px'>{repeat_badge} {feedback_badge}</div></td>
+                  <td>{work_count}건</td>
+                  <td>{actions}</td>
+                </tr>
+                """.format(
+                    code=esc(row["complaint_code"]),
+                    title=esc(row["title"]),
+                    channel=esc(row["channel"]),
+                    category=esc(row["category_primary"] or "-"),
+                    requester=esc(f"{row['requester_name'] or '-'} / {row['requester_phone'] or '-'}"),
+                    location=esc(row["unit_label"] or row["location_detail"] or "-"),
+                    facility=esc(row["facility_name"] or "시설 미지정"),
+                    priority=status_badge(row["priority"]),
+                    status=status_badge(row["status"]),
+                    sla=_complaint_sla_badge(row),
+                    assignee=esc(row["assignee_name"] or "미배정"),
+                    due=esc(due_text),
+                    repeat_badge=repeat_badge,
+                    feedback_badge=feedback_badge,
+                    work_count=esc(row["work_count"]),
+                    actions="".join(row_actions),
+                )
+            )
+        list_html = (
+            "<section class='panel'><div class='split'><div><h2>민원 목록</h2><p class='muted'>접수부터 회신, 종결까지 민원 기준으로 추적합니다.</p></div>"
+            "<form class='inline-form' method='get' action='/complaints'>"
+            f"<input name='q' value='{esc(q)}' placeholder='번호, 제목, 민원인, 연락처, 위치 검색'>"
+            f"<select name='status'>{render_options(COMPLAINT_STATUS_OPTIONS, status, blank_label='전체 상태')}</select>"
+            f"<select name='channel'>{render_options(COMPLAINT_CHANNEL_OPTIONS, channel, blank_label='전체 채널')}</select>"
+            f"<select name='priority'>{render_options(COMPLAINT_PRIORITY_OPTIONS, priority, blank_label='전체 우선도')}</select>"
+            "<button class='btn secondary' type='submit'>검색</button>"
+            "</form></div>"
+            "<table><thead><tr><th>번호</th><th>민원</th><th>위치</th><th>우선도/상태</th><th>담당/기한</th><th>연결 작업</th><th>관리</th></tr></thead>"
+            f"<tbody>{''.join(rows_html)}</tbody></table></section>"
+        )
+    else:
+        list_html = "<section class='panel'><h2>민원 목록</h2>" + empty_state("조건에 맞는 민원이 없습니다.") + "</section>"
+
+    flash_message, flash_level = _flash_from_request(request)
+    body = (
+        page_header(
+            "Complaints",
+            "민원 관리",
+            "민원 접수, 분류, 배정, 회신, 작업지시 연결을 하나의 흐름으로 관리합니다.",
+        )
+        + "<div class='layout-2'>"
+        + form_html
+        + list_html
+        + "</div>"
+    )
+    return HTMLResponse(layout(title="민원 관리", body=body, user=user, flash_message=flash_message, flash_level=flash_level))
+
+
+@app.post("/complaints/save")
+def complaints_save(
+    request: Request,
+    complaint_id: str = Form(""),
+    channel: str = Form("전화"),
+    category_primary: str = Form(""),
+    category_secondary: str = Form(""),
+    facility_id: str = Form(""),
+    unit_label: str = Form(""),
+    location_detail: str = Form(""),
+    requester_name: str = Form(""),
+    requester_phone: str = Form(""),
+    requester_email: str = Form(""),
+    title: str = Form(...),
+    description: str = Form(""),
+    priority: str = Form("보통"),
+    status: str = Form("접수"),
+    response_due_at: str = Form(""),
+    assignee_user_id: str = Form(""),
+    files: List[UploadFile] = File(default=[]),
+):
+    user, error = _authorize(request, "complaints:view")
+    if error:
+        return error
+
+    complaint_id_i = _parse_int(complaint_id, 0)
+    facility_id_i = _parse_int(facility_id, 0) or None
+    assignee_id_i = _parse_int(assignee_user_id, 0) or None
+    requester_phone_v = auth.normalize_phone(requester_phone)
+    requester_email_v = requester_email.strip()
+
+    conn = get_conn()
+    if complaint_id_i:
+        existing = conn.execute("SELECT * FROM complaints WHERE id = ?", (complaint_id_i,)).fetchone()
+        if not existing:
+            conn.close()
+            return _with_flash("/complaints", "민원을 찾을 수 없습니다.", "error")
+        if not _can_manage_complaint(user, existing):
+            conn.close()
+            return _with_flash(f"/complaints?edit={complaint_id_i}", "이 민원의 기본정보를 수정할 권한이 없습니다.", "error")
+
+        response_due_at_v = _normalize_complaint_due_date(response_due_at, priority.strip(), existing)
+        resolved_at, closed_at = _complaint_timestamps(status.strip(), existing)
+        conn.execute(
+            """
+            UPDATE complaints
+            SET channel = ?, category_primary = ?, category_secondary = ?, facility_id = ?, unit_label = ?, location_detail = ?,
+                requester_name = ?, requester_phone = ?, requester_email = ?, title = ?, description = ?, priority = ?, status = ?,
+                response_due_at = ?, resolved_at = ?, closed_at = ?, assignee_user_id = ?, updated_by = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                channel.strip(),
+                category_primary.strip(),
+                category_secondary.strip(),
+                facility_id_i,
+                unit_label.strip(),
+                location_detail.strip(),
+                requester_name.strip(),
+                requester_phone_v,
+                requester_email_v,
+                title.strip(),
+                description.strip(),
+                priority.strip(),
+                status.strip(),
+                response_due_at_v,
+                resolved_at,
+                closed_at,
+                assignee_id_i,
+                user["id"],
+                _now_text(),
+                complaint_id_i,
+            ),
+        )
+        _record_complaint_update(
+            conn,
+            complaint_id_i,
+            "기본정보수정",
+            "민원 기본정보가 수정되었습니다.",
+            user["id"],
+            status_from=existing["status"] if existing["status"] != status.strip() else "",
+            status_to=status.strip() if existing["status"] != status.strip() else "",
+        )
+        _save_attachments(conn, "complaint", complaint_id_i, files, user["id"])
+        conn.commit()
+        conn.close()
+        return _with_flash(f"/complaints?edit={complaint_id_i}", "민원이 수정되었습니다.", "ok")
+
+    if not auth.has_permission(user["role"], "complaints:create"):
+        conn.close()
+        return _with_flash("/complaints", "민원을 등록할 권한이 없습니다.", "error")
+
+    response_due_at_v = _normalize_complaint_due_date(response_due_at, priority.strip())
+    resolved_at, closed_at = _complaint_timestamps(status.strip())
+    cursor = conn.execute(
+        """
+        INSERT INTO complaints(
+            complaint_code, channel, category_primary, category_secondary, facility_id, unit_label, location_detail,
+            requester_name, requester_phone, requester_email, title, description, priority, status, response_due_at,
+            resolved_at, closed_at, assignee_user_id, created_by, updated_by, created_at, updated_at
+        )
+        VALUES ('', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            channel.strip(),
+            category_primary.strip(),
+            category_secondary.strip(),
+            facility_id_i,
+            unit_label.strip(),
+            location_detail.strip(),
+            requester_name.strip(),
+            requester_phone_v,
+            requester_email_v,
+            title.strip(),
+            description.strip(),
+            priority.strip(),
+            status.strip(),
+            response_due_at_v,
+            resolved_at,
+            closed_at,
+            assignee_id_i,
+            user["id"],
+            user["id"],
+            _now_text(),
+            _now_text(),
+        ),
+    )
+    complaint_id_i = cursor.lastrowid
+    conn.execute("UPDATE complaints SET complaint_code = ? WHERE id = ?", (f"CP-{complaint_id_i:04d}", complaint_id_i))
+    _record_complaint_update(conn, complaint_id_i, "접수", "민원이 접수되었습니다.", user["id"], status_to=status.strip())
+    _save_attachments(conn, "complaint", complaint_id_i, files, user["id"])
+    conn.commit()
+    conn.close()
+    return _with_flash(f"/complaints?edit={complaint_id_i}", "민원이 등록되었습니다.", "ok")
+
+
+@app.post("/complaints/update/{complaint_id}")
+def complaints_update(
+    request: Request,
+    complaint_id: int,
+    update_type: str = Form(...),
+    message: str = Form(...),
+    status: str = Form(""),
+    is_public_note: str = Form(""),
+    files: List[UploadFile] = File(default=[]),
+):
+    user, error = _authorize(request, "complaints:update")
+    if error:
+        return error
+
+    conn = get_conn()
+    complaint = conn.execute("SELECT * FROM complaints WHERE id = ?", (complaint_id,)).fetchone()
+    if not complaint:
+        conn.close()
+        return _with_flash("/complaints", "민원을 찾을 수 없습니다.", "error")
+    if not _can_update_complaint(user, complaint):
+        conn.close()
+        return _with_flash(f"/complaints?edit={complaint_id}", "이 민원을 업데이트할 권한이 없습니다.", "error")
+
+    new_status = status.strip() or complaint["status"]
+    resolved_at, closed_at = _complaint_timestamps(new_status, complaint)
+    conn.execute(
+        """
+        UPDATE complaints
+        SET status = ?, resolved_at = ?, closed_at = ?, updated_by = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (new_status, resolved_at, closed_at, user["id"], _now_text(), complaint_id),
+    )
+    _record_complaint_update(
+        conn,
+        complaint_id,
+        update_type.strip(),
+        message.strip(),
+        user["id"],
+        status_from=complaint["status"] if complaint["status"] != new_status else "",
+        status_to=new_status if complaint["status"] != new_status else "",
+        is_public_note=1 if _bool_from_form(is_public_note) else 0,
+    )
+    _save_attachments(conn, "complaint", complaint_id, files, user["id"])
+    conn.commit()
+    conn.close()
+    return _with_flash(f"/complaints?edit={complaint_id}", "민원 업데이트가 저장되었습니다.", "ok")
+
+
+@app.post("/complaints/feedback/{complaint_id}")
+def complaints_feedback(
+    request: Request,
+    complaint_id: int,
+    rating: str = Form(...),
+    comment: str = Form(""),
+    follow_up_at: str = Form(""),
+):
+    user, error = _authorize(request, "complaints:update")
+    if error:
+        return error
+
+    rating_i = _parse_int(rating, 0)
+    if rating_i < 1 or rating_i > 5:
+        return _with_flash(f"/complaints?edit={complaint_id}", "만족도는 1점부터 5점 사이여야 합니다.", "error")
+
+    conn = get_conn()
+    complaint = conn.execute("SELECT * FROM complaints WHERE id = ?", (complaint_id,)).fetchone()
+    if not complaint:
+        conn.close()
+        return _with_flash("/complaints", "민원을 찾을 수 없습니다.", "error")
+    if not _can_update_complaint(user, complaint):
+        conn.close()
+        return _with_flash(f"/complaints?edit={complaint_id}", "이 민원의 만족도를 기록할 권한이 없습니다.", "error")
+
+    existing = conn.execute("SELECT * FROM complaint_feedback WHERE complaint_id = ?", (complaint_id,)).fetchone()
+    if existing:
+        conn.execute(
+            """
+            UPDATE complaint_feedback
+            SET rating = ?, comment = ?, follow_up_at = ?, updated_by = ?, updated_at = ?
+            WHERE complaint_id = ?
+            """,
+            (rating_i, comment.strip(), follow_up_at.strip(), user["id"], _now_text(), complaint_id),
+        )
+        action_message = "만족도 정보가 수정되었습니다."
+    else:
+        conn.execute(
+            """
+            INSERT INTO complaint_feedback(
+                complaint_id, rating, comment, follow_up_at, created_by, updated_by, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (complaint_id, rating_i, comment.strip(), follow_up_at.strip(), user["id"], user["id"], _now_text(), _now_text()),
+        )
+        action_message = "만족도 정보가 기록되었습니다."
+
+    conn.execute(
+        "UPDATE complaints SET updated_by = ?, updated_at = ? WHERE id = ?",
+        (user["id"], _now_text(), complaint_id),
+    )
+    _record_complaint_update(
+        conn,
+        complaint_id,
+        "만족도",
+        f"만족도 {rating_i}점이 기록되었습니다." + (f" 메모: {comment.strip()}" if comment.strip() else ""),
+        user["id"],
+    )
+    conn.commit()
+    conn.close()
+    return _with_flash(f"/complaints?edit={complaint_id}", action_message, "ok")
+
+
+@app.post("/complaints/delete/{complaint_id}")
+def complaints_delete(request: Request, complaint_id: int):
+    user, error = _authorize(request, "complaints:view")
+    if error:
+        return error
+    conn = get_conn()
+    complaint = conn.execute("SELECT * FROM complaints WHERE id = ?", (complaint_id,)).fetchone()
+    if not complaint:
+        conn.close()
+        return _with_flash("/complaints", "민원을 찾을 수 없습니다.", "error")
+    if not _can_delete_complaint(user, complaint):
+        conn.close()
+        return _with_flash(f"/complaints?edit={complaint_id}", "이 민원을 삭제할 권한이 없습니다.", "error")
+    _delete_attachments(conn, "complaint", complaint_id)
+    conn.execute("UPDATE work_orders SET complaint_id = NULL, updated_by = ?, updated_at = ? WHERE complaint_id = ?", (user["id"], _now_text(), complaint_id))
+    conn.execute("DELETE FROM complaint_updates WHERE complaint_id = ?", (complaint_id,))
+    conn.execute("DELETE FROM complaints WHERE id = ?", (complaint_id,))
+    conn.commit()
+    conn.close()
+    return _with_flash("/complaints", "민원이 삭제되었습니다.", "ok")
+
+
 @app.get("/reports", response_class=HTMLResponse)
 def reports_page(request: Request):
     user, error = _authorize(request, "reports:view")
@@ -2229,6 +3375,78 @@ def reports_page(request: Request):
         """,
         (_today_text(),),
     ).fetchone()["count"]
+    created_complaints = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM complaints
+        WHERE substr(created_at, 1, 10) BETWEEN ? AND ?
+        """,
+        (start, end),
+    ).fetchone()["count"]
+    closed_complaints = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM complaints
+        WHERE closed_at != ''
+          AND substr(closed_at, 1, 10) BETWEEN ? AND ?
+        """,
+        (start, end),
+    ).fetchone()["count"]
+    open_complaints = conn.execute(
+        "SELECT COUNT(*) AS count FROM complaints WHERE status NOT IN ('종결', '취소')"
+    ).fetchone()["count"]
+    overdue_complaints = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM complaints
+        WHERE response_due_at != ''
+          AND response_due_at < ?
+          AND status NOT IN ('회신완료', '종결', '취소')
+        """,
+        (_today_text(),),
+    ).fetchone()["count"]
+    due_today_complaints = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM complaints
+        WHERE response_due_at = ?
+          AND status NOT IN ('회신완료', '종결', '취소')
+        """,
+        (_today_text(),),
+    ).fetchone()["count"]
+    repeat_complaints = conn.execute(
+        f"""
+        SELECT COUNT(*) AS count
+        FROM complaints c
+        WHERE substr(c.created_at, 1, 10) BETWEEN ? AND ?
+          AND EXISTS (
+            SELECT 1
+            FROM complaints c2
+            WHERE c2.id != c.id
+              AND c.requester_phone != ''
+              AND c2.requester_phone = c.requester_phone
+              AND c2.created_at >= datetime(c.created_at, '-{COMPLAINT_REPEAT_WINDOW_DAYS} days')
+              AND (
+                (c.facility_id IS NOT NULL AND c2.facility_id = c.facility_id)
+                OR (c.unit_label != '' AND c2.unit_label = c.unit_label)
+                OR (c.location_detail != '' AND c2.location_detail = c.location_detail)
+                OR (c.category_primary != '' AND c2.category_primary = c.category_primary)
+              )
+          )
+        """,
+        (start, end),
+    ).fetchone()["count"]
+    feedback_stats = conn.execute(
+        """
+        SELECT COUNT(*) AS count,
+               ROUND(AVG(rating), 1) AS avg_rating,
+               SUM(CASE WHEN rating >= 4 THEN 1 ELSE 0 END) AS satisfied_count,
+               SUM(CASE WHEN rating <= 2 THEN 1 ELSE 0 END) AS dissatisfied_count
+        FROM complaint_feedback
+        WHERE substr(updated_at, 1, 10) BETWEEN ? AND ?
+        """,
+        (start, end),
+    ).fetchone()
     low_stock_rows = conn.execute(
         """
         SELECT item_code, name, quantity, min_quantity, unit, location
@@ -2267,6 +3485,64 @@ def reports_page(request: Request):
         """,
         (start, end),
     ).fetchall()
+    complaint_updates = conn.execute(
+        """
+        SELECT cu.created_at, cu.update_type, cu.message, cu.status_from, cu.status_to, c.complaint_code, c.title
+        FROM complaint_updates cu
+        JOIN complaints c ON c.id = cu.complaint_id
+        WHERE substr(cu.created_at, 1, 10) BETWEEN ? AND ?
+        ORDER BY cu.created_at DESC, cu.id DESC
+        LIMIT 8
+        """,
+        (start, end),
+    ).fetchall()
+    overdue_complaint_rows = conn.execute(
+        """
+        SELECT complaint_code, title, requester_name, priority, status, response_due_at
+        FROM complaints
+        WHERE response_due_at != ''
+          AND response_due_at < ?
+          AND status NOT IN ('회신완료', '종결', '취소')
+        ORDER BY CASE priority WHEN '긴급' THEN 1 WHEN '높음' THEN 2 ELSE 3 END, response_due_at ASC, updated_at DESC
+        LIMIT 10
+        """,
+        (_today_text(),),
+    ).fetchall()
+    repeat_complaint_rows = conn.execute(
+        f"""
+        SELECT c.complaint_code, c.title, c.requester_name, c.requester_phone, c.category_primary, c.status, c.created_at
+        FROM complaints c
+        WHERE substr(c.created_at, 1, 10) BETWEEN ? AND ?
+          AND EXISTS (
+            SELECT 1
+            FROM complaints c2
+            WHERE c2.id != c.id
+              AND c.requester_phone != ''
+              AND c2.requester_phone = c.requester_phone
+              AND c2.created_at >= datetime(c.created_at, '-{COMPLAINT_REPEAT_WINDOW_DAYS} days')
+              AND (
+                (c.facility_id IS NOT NULL AND c2.facility_id = c.facility_id)
+                OR (c.unit_label != '' AND c2.unit_label = c.unit_label)
+                OR (c.location_detail != '' AND c2.location_detail = c.location_detail)
+                OR (c.category_primary != '' AND c2.category_primary = c.category_primary)
+              )
+          )
+        ORDER BY c.created_at DESC, c.id DESC
+        LIMIT 10
+        """,
+        (start, end),
+    ).fetchall()
+    feedback_rows = conn.execute(
+        """
+        SELECT c.complaint_code, c.title, cf.rating, cf.comment, cf.follow_up_at, cf.updated_at
+        FROM complaint_feedback cf
+        JOIN complaints c ON c.id = cf.complaint_id
+        WHERE substr(cf.updated_at, 1, 10) BETWEEN ? AND ?
+        ORDER BY cf.rating ASC, cf.updated_at DESC, cf.id DESC
+        LIMIT 10
+        """,
+        (start, end),
+    ).fetchall()
     tx_count = conn.execute(
         """
         SELECT COUNT(*) AS count
@@ -2281,13 +3557,27 @@ def reports_page(request: Request):
         "[시설 운영 요약 보고서]",
         f"기간: {start} ~ {end}",
         "",
-        "1. 작업지시 현황",
+        "1. 민원 현황",
+        f"- 신규 접수: {created_complaints}건",
+        f"- 종결 처리: {closed_complaints}건",
+        f"- 현재 진행: {open_complaints}건",
+        f"- 회신 지연: {overdue_complaints}건",
+        f"- SLA 오늘 마감: {due_today_complaints}건",
+        f"- 반복 민원: {repeat_complaints}건",
+        "",
+        "2. 만족도",
+        f"- 만족도 기록: {feedback_stats['count']}건",
+        f"- 평균 점수: {feedback_stats['avg_rating'] or '-'}",
+        f"- 만족(4점 이상): {int(feedback_stats['satisfied_count'] or 0)}건",
+        f"- 불만(2점 이하): {int(feedback_stats['dissatisfied_count'] or 0)}건",
+        "",
+        "3. 작업지시 현황",
         f"- 신규 등록: {created_work}건",
         f"- 완료 처리: {completed_work}건",
         f"- 현재 미완료: {open_work}건",
         f"- 지연 작업: {overdue_work}건",
         "",
-        "2. 재고 운영",
+        "4. 재고 운영",
         f"- 기간 중 수불 처리: {tx_count}건",
         f"- 부족 재고 경고: {len(low_stock_rows)}건",
     ]
@@ -2299,7 +3589,7 @@ def reports_page(request: Request):
     else:
         report_lines.append("  · 부족 재고 없음")
 
-    report_lines.extend(["", "3. 우선 조치 대상"])
+    report_lines.extend(["", "5. 우선 조치 대상"])
     if high_priority_rows:
         for row in high_priority_rows[:5]:
             report_lines.append(
@@ -2308,7 +3598,16 @@ def reports_page(request: Request):
     else:
         report_lines.append("  · 긴급/높음 미완료 작업 없음")
 
-    report_lines.extend(["", "4. 시설 상태"])
+    report_lines.extend(["", "6. 민원 지연 현황"])
+    if overdue_complaint_rows:
+        for row in overdue_complaint_rows[:5]:
+            report_lines.append(
+                f"  · {row['complaint_code']} {row['title']} / {row['priority']} / {row['status']} / 회신 목표 {fmt_date(row['response_due_at'])}"
+            )
+    else:
+        report_lines.append("  · 지연 민원 없음")
+
+    report_lines.extend(["", "7. 시설 상태"])
     if facility_status_rows:
         for row in facility_status_rows:
             report_lines.append(f"  · {row['status']}: {row['count']}개")
@@ -2317,11 +3616,44 @@ def reports_page(request: Request):
 
     metrics = (
         "<section class='metrics'>"
+        + metric_card("신규 민원", created_complaints, f"종결 {closed_complaints}건")
+        + metric_card("진행 민원", open_complaints, f"회신 지연 {overdue_complaints}건 / 오늘 마감 {due_today_complaints}건")
+        + metric_card("반복 민원", repeat_complaints, f"최근 {COMPLAINT_REPEAT_WINDOW_DAYS}일 기준")
+        + metric_card("만족도 평균", feedback_stats["avg_rating"] or "-", f"피드백 {feedback_stats['count']}건")
         + metric_card("신규 작업", created_work, f"{start}~{end}")
         + metric_card("완료 작업", completed_work, f"현재 미완료 {open_work}건")
-        + metric_card("지연 작업", overdue_work, "기한 초과 기준")
+        + metric_card("지연 작업", overdue_work, f"저평가 {int(feedback_stats['dissatisfied_count'] or 0)}건")
         + metric_card("재고 변동", tx_count, f"부족 경고 {len(low_stock_rows)}건")
         + "</section>"
+    )
+
+    overdue_complaints_html = (
+        "<table><thead><tr><th>번호</th><th>민원</th><th>요청자</th><th>우선도</th><th>상태</th><th>회신 목표일</th></tr></thead><tbody>"
+        + (
+            "".join(
+                """
+                <tr>
+                  <td>{code}</td>
+                  <td>{title}</td>
+                  <td>{requester}</td>
+                  <td>{priority}</td>
+                  <td>{status}</td>
+                  <td>{due}</td>
+                </tr>
+                """.format(
+                    code=esc(row["complaint_code"]),
+                    title=esc(row["title"]),
+                    requester=esc(row["requester_name"] or "-"),
+                    priority=status_badge(row["priority"]),
+                    status=status_badge(row["status"]),
+                    due=esc(fmt_date(row["response_due_at"])),
+                )
+                for row in overdue_complaint_rows
+            )
+            if overdue_complaint_rows
+            else "<tr><td colspan='6' class='muted'>지연 민원이 없습니다.</td></tr>"
+        )
+        + "</tbody></table>"
     )
 
     low_stock_html = (
@@ -2403,6 +3735,90 @@ def reports_page(request: Request):
         + "</tbody></table>"
     )
 
+    complaint_updates_html = (
+        "<table><thead><tr><th>시각</th><th>민원</th><th>유형</th><th>상태변경</th><th>내용</th></tr></thead><tbody>"
+        + (
+            "".join(
+                """
+                <tr>
+                  <td>{when}</td>
+                  <td><strong>{code}</strong><div class='muted'>{title}</div></td>
+                  <td>{type}</td>
+                  <td>{status_move}</td>
+                  <td>{body}</td>
+                </tr>
+                """.format(
+                    when=esc(fmt_datetime(row["created_at"])),
+                    code=esc(row["complaint_code"]),
+                    title=esc(row["title"]),
+                    type=status_badge(row["update_type"]),
+                    status_move=esc(f"{row['status_from'] or '-'} -> {row['status_to'] or '-'}"),
+                    body=esc(row["message"]),
+                )
+                for row in complaint_updates
+            )
+            if complaint_updates
+            else "<tr><td colspan='5' class='muted'>기간 내 민원 업데이트가 없습니다.</td></tr>"
+        )
+        + "</tbody></table>"
+    )
+
+    repeat_complaints_html = (
+        "<table><thead><tr><th>번호</th><th>민원</th><th>민원인</th><th>분류</th><th>상태</th><th>접수일</th></tr></thead><tbody>"
+        + (
+            "".join(
+                """
+                <tr>
+                  <td>{code}</td>
+                  <td>{title}</td>
+                  <td>{requester}</td>
+                  <td>{category}</td>
+                  <td>{status}</td>
+                  <td>{created_at}</td>
+                </tr>
+                """.format(
+                    code=esc(row["complaint_code"]),
+                    title=esc(row["title"]),
+                    requester=esc(f"{row['requester_name'] or '-'} / {row['requester_phone'] or '-'}"),
+                    category=esc(row["category_primary"] or "-"),
+                    status=status_badge(row["status"]),
+                    created_at=esc(fmt_datetime(row["created_at"])),
+                )
+                for row in repeat_complaint_rows
+            )
+            if repeat_complaint_rows
+            else "<tr><td colspan='6' class='muted'>기간 내 반복 민원이 없습니다.</td></tr>"
+        )
+        + "</tbody></table>"
+    )
+
+    feedback_html = (
+        "<table><thead><tr><th>번호</th><th>민원</th><th>만족도</th><th>후속 연락일</th><th>코멘트</th></tr></thead><tbody>"
+        + (
+            "".join(
+                """
+                <tr>
+                  <td>{code}</td>
+                  <td>{title}</td>
+                  <td>{rating}</td>
+                  <td>{follow_up_at}</td>
+                  <td>{comment}</td>
+                </tr>
+                """.format(
+                    code=esc(row["complaint_code"]),
+                    title=esc(row["title"]),
+                    rating=_complaint_feedback_badge(row["rating"]),
+                    follow_up_at=esc(fmt_date(row["follow_up_at"] or row["updated_at"])),
+                    comment=esc(row["comment"] or "-"),
+                )
+                for row in feedback_rows
+            )
+            if feedback_rows
+            else "<tr><td colspan='5' class='muted'>기간 내 만족도 기록이 없습니다.</td></tr>"
+        )
+        + "</tbody></table>"
+    )
+
     flash_message, flash_level = _flash_from_request(request)
     body = (
         page_header(
@@ -2423,6 +3839,12 @@ def reports_page(request: Request):
         + "<section class='panel'><h2>자동 생성 보고문</h2><div class='report-box'>"
         + esc("\n".join(report_lines))
         + "</div></section>"
+        + "<section class='panel'><h2>지연 민원</h2>"
+        + overdue_complaints_html
+        + "</section>"
+        + "<section class='panel'><h2>반복 민원</h2>"
+        + repeat_complaints_html
+        + "</section>"
         + "<section class='panel'><h2>부족 재고</h2>"
         + low_stock_html
         + "</section></div>"
@@ -2430,7 +3852,13 @@ def reports_page(request: Request):
         + "<section class='panel'><h2>우선 조치 대상</h2>"
         + high_priority_html
         + "</section>"
-        + "<section class='panel'><h2>기간 내 주요 업데이트</h2>"
+        + "<section class='panel'><h2>만족도 기록</h2>"
+        + feedback_html
+        + "</section>"
+        + "<section class='panel'><h2>기간 내 민원 업데이트</h2>"
+        + complaint_updates_html
+        + "</section>"
+        + "<section class='panel'><h2>기간 내 작업 업데이트</h2>"
         + updates_html
         + "</section></div></div>"
     )

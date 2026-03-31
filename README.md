@@ -6,6 +6,10 @@
 
 - 시설 관리
 - 재고 관리
+- 민원 관리
+- 민원 만족도 기록
+- 민원 SLA 경고 / 반복 민원 감지
+- 민원 회신 템플릿
 - 재고 수불 이력
 - 작업지시 및 진행 업데이트
 - 운영 보고서
@@ -57,14 +61,21 @@ uvicorn ops_main:app --host 0.0.0.0 --port $env:PORT
 ## DB 관리
 
 - 관리자 로그인 후 상단 `DB관리` 메뉴에서만 모든 운영 테이블을 raw DB 수준으로 조회·등록·수정·삭제 가능
-- 대상 테이블: `users`, `sessions`, `facilities`, `inventory_items`, `inventory_transactions`, `work_orders`, `work_order_updates`, `attachments`
+- 대상 테이블: `users`, `sessions`, `facilities`, `inventory_items`, `inventory_transactions`, `complaints`, `complaint_updates`, `complaint_feedback`, `complaint_response_templates`, `work_orders`, `work_order_updates`, `attachments`
 
 ## 권한 분리
 
-- `admin`: 사용자 관리, raw DB 관리, 전체 업무 데이터 관리
-- `manager`: 시설/재고/작업지시 전체 관리, raw DB 직접 접근 불가
-- `technician`: 재고 수불 처리, 작업지시 등록, 본인 생성 또는 본인 배정 작업지시 업데이트
-- `viewer`: 조회 전용
+- `admin`: 사용자 관리, raw DB 관리, 민원/시설/재고/작업지시 전체 관리
+- `manager`: 민원/시설/재고/작업지시 전체 관리, raw DB 직접 접근 불가
+- `technician`: 민원 접수, 본인 민원 업데이트, 만족도 기록, 재고 수불 처리, 작업지시 등록, 본인 생성 또는 본인 배정 작업지시 업데이트
+- `viewer`: 대시보드, 민원, 시설, 재고, 작업지시, 보고서 조회만 허용
+
+## 민원 2차 기능
+
+- `SLA 자동 계산`: 회신 목표일을 비워 두면 우선도 기준(`긴급 0일`, `높음 1일`, `보통 3일`, `낮음 5일`)으로 자동 입력
+- `반복 민원 감지`: 같은 연락처 기준 최근 90일 내 유사 위치/분류 민원을 상세 화면과 보고서에서 표시
+- `만족도 기록`: 민원별 1~5점 만족도와 후속 연락일, 코멘트를 기록
+- `회신 템플릿`: 공통/분류별 회신 템플릿을 기본 제공하고 `DB관리 > complaint_response_templates`에서 수정 가능
 
 ## Render 배포
 
@@ -86,4 +97,5 @@ python scripts/seed_team.py
 ## 문서
 
 - `docs/operations_redesign_plan.md`
+- `docs/complaint_integration_plan.md`
 - `docs/team_and_deployment_runbook.md`
