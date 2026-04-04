@@ -33,7 +33,7 @@ uvicorn ops_main:app --host 0.0.0.0 --port $env:PORT
 
 ## 점검 / 테스트
 
-- 문법 점검: `python -m py_compile ops_main.py scripts\check_crud_flows.py scripts\check_stability_flows.py scripts\import_legacy_complaints.py`
+- 문법 점검: `python -m py_compile ops_main.py scripts\check_crud_flows.py scripts\check_stability_flows.py scripts\import_legacy_complaints_api.py`
 - CRUD 회귀 점검: `python scripts/check_crud_flows.py`
 - 안정화 스모크 점검: `python scripts/check_stability_flows.py`
 
@@ -84,17 +84,16 @@ uvicorn ops_main:app --host 0.0.0.0 --port $env:PORT
 - `만족도 기록`: 민원별 1~5점 만족도와 후속 연락일, 코멘트를 기록
 - `회신 템플릿`: 공통/분류별 회신 템플릿을 기본 제공하고 `DB관리 > complaint_response_templates`에서 수정 가능
 
-## 이전 민원 DB 이관
+## 세대 민원 API 이관
 
-- 레거시 Render 서비스의 `work_orders`, `work_order_events`를 현재 `complaints`, `complaint_updates`, `work_orders`로 옮기는 스크립트: `python scripts/import_legacy_complaints.py`
-- 원본 건수만 확인: `python scripts/import_legacy_complaints.py --inspect`
-- 실제 쓰기 없이 드라이런: `python scripts/import_legacy_complaints.py`
-- 실제 이관 실행: `python scripts/import_legacy_complaints.py --apply`
-- 기본값은 이전 Render 서비스의 `DATABASE_URL`을 `RENDER_API_KEY`로 읽어오며, 외부 접속용 Postgres URL로 자동 변환한다.
-- `LEGACY_DATABASE_URL` 또는 `--legacy-db-url`를 주면 직접 지정한 PostgreSQL URL도 사용할 수 있다.
-- 기존에 이미 들어간 `LGCY-*` 코드가 있으면 기본은 건너뛰고, `--update-existing`일 때만 덮어쓴다.
-- 관리자 화면에서도 `DB관리 > 레거시 민원 이관` 패널에서 `원본 확인`, `드라이런`, `실제 이관`을 실행할 수 있다.
-- 운영 배포본에서 버튼으로 바로 돌리려면 `LEGACY_DATABASE_URL` 환경변수에 이전 DB 접속 문자열을 넣어 두는 편이 가장 단순하다.
+- `https://ka-facility-os.onrender.com/web/complaints`가 쓰는 민원 API를 현재 `complaints`, `complaint_updates`, `work_orders`로 옮기는 스크립트: `python scripts/import_legacy_complaints_api.py --site 연산더샵`
+- 원본 건수만 확인: `python scripts/import_legacy_complaints_api.py --site 연산더샵 --inspect`
+- 실제 쓰기 없이 드라이런: `python scripts/import_legacy_complaints_api.py --site 연산더샵`
+- 실제 이관 실행: `python scripts/import_legacy_complaints_api.py --site 연산더샵 --apply`
+- 기본값은 소스 서비스의 `ADMIN_TOKEN`을 `RENDER_API_KEY`로 읽어오며, 필요하면 `--admin-token` 또는 `LEGACY_ADMIN_TOKEN`으로 직접 지정할 수 있다.
+- `--import-work-orders`를 주면 민원과 함께 작업지시도 같이 생성한다.
+- 기존에 이미 들어간 `API-*` 코드가 있으면 기본은 건너뛰고, `--update-existing`일 때만 덮어쓴다.
+- 관리자 화면에서도 `DB관리 > 세대 민원 API 이관` 패널에서 `원본 확인`, `드라이런`, `실제 이관`을 실행할 수 있다.
 
 ## Render 배포
 

@@ -79,8 +79,16 @@ COMPLAINT_RESOLVED_STATUSES = {"처리완료", "회신완료", "종결"}
 COMPLAINT_CLOSED_STATUSES = {"종결", "취소"}
 COMPLAINT_SLA_DAYS = {"긴급": 0, "높음": 1, "보통": 3, "낮음": 5}
 COMPLAINT_REPEAT_WINDOW_DAYS = 90
-LEGACY_IMPORT_DEFAULT_SERVICE_ID = os.getenv("LEGACY_RENDER_SERVICE_ID", "srv-d6g57jbuibrs739g5mvg").strip()
-LEGACY_IMPORT_DEFAULT_DB_URL = os.getenv("LEGACY_DATABASE_URL", "").strip()
+COMPLAINTS_API_IMPORT_DEFAULT_BASE_URL = os.getenv(
+    "LEGACY_COMPLAINTS_API_BASE_URL",
+    "https://ka-facility-os.onrender.com",
+).strip()
+COMPLAINTS_API_IMPORT_DEFAULT_SITE = os.getenv("LEGACY_COMPLAINTS_SITE", "").strip()
+COMPLAINTS_API_IMPORT_DEFAULT_SERVICE_ID = os.getenv(
+    "LEGACY_COMPLAINTS_RENDER_SERVICE_ID",
+    os.getenv("LEGACY_RENDER_SERVICE_ID", "srv-d6g57jbuibrs739g5mvg").strip(),
+).strip()
+COMPLAINTS_API_IMPORT_DEFAULT_TOKEN = os.getenv("LEGACY_ADMIN_TOKEN", "").strip()
 
 
 def _parse_int(value, default: int = 0) -> int:
@@ -855,45 +863,50 @@ def _db_backup_snapshot(prefix: str) -> Path:
     return backup_path
 
 
-def _legacy_import_panel() -> str:
+def _complaints_api_import_panel() -> str:
     source_hint = (
-        "환경변수 LEGACY_DATABASE_URL을 기본 사용합니다."
-        if LEGACY_IMPORT_DEFAULT_DB_URL
-        else f"입력값이 비어 있으면 Render 서비스 {LEGACY_IMPORT_DEFAULT_SERVICE_ID} 의 DATABASE_URL을 사용합니다."
+        "소스 관리자 토큰을 비워 두면 Render 서비스에서 ADMIN_TOKEN을 읽어옵니다."
+        if not COMPLAINTS_API_IMPORT_DEFAULT_TOKEN
+        else "환경변수 LEGACY_ADMIN_TOKEN을 기본 사용합니다."
     )
     return (
-        "<section class='panel'><h2>레거시 민원 이관</h2>"
-        "<p class='muted'>이전 ka-facility-os의 work_orders, work_order_events를 현재 민원/작업지시 구조로 변환합니다.</p>"
+        "<section class='panel'><h2>세대 민원 API 이관</h2>"
+        "<p class='muted'>ka-facility-os의 세대 민원 API(cases/events/messages)를 현재 민원 구조로 변환합니다.</p>"
         f"{info_box('기본 소스', source_hint)}"
-        "<form action='/admin/legacy-import' method='post' class='stack'>"
-        f"<div><label>레거시 Database URL (선택)</label><input name='legacy_db_url' type='password' value='' autocomplete='off' placeholder='비워 두면 기본 소스를 사용합니다.'></div>"
-        f"<div><label>Render 서비스 ID</label><input name='render_service_id' value='{esc(LEGACY_IMPORT_DEFAULT_SERVICE_ID)}' placeholder='srv-...'></div>"
-        "<label style='display:flex;align-items:center;gap:8px;'><input name='update_existing' type='checkbox' value='1' style='width:auto;'>이미 이관된 LGCY-* 레코드도 덮어쓰기</label>"
-        "<label style='display:flex;align-items:center;gap:8px;'><input name='skip_work_orders' type='checkbox' value='1' style='width:auto;'>연결 작업지시 생성 생략</label>"
+        f"{info_box('기본 동작', '민원 본체와 처리 이력을 우선 이관합니다. 작업지시는 필요할 때만 생성하는 편이 안전합니다.')}"
+        "<form action='/admin/complaints-api-import' method='post' class='stack'>"
+        f"<div><label>소스 서비스 URL</label><input name='base_url' value='{esc(COMPLAINTS_API_IMPORT_DEFAULT_BASE_URL)}' placeholder='https://ka-facility-os.onrender.com'></div>"
+        f"<div><label>site</label><input name='site' value='{esc(COMPLAINTS_API_IMPORT_DEFAULT_SITE)}' placeholder='예: 연산더샵'></div>"
+        "<div><label>소스 X-Admin-Token (선택)</label><input name='admin_token' type='password' value='' autocomplete='off' placeholder='비워 두면 기본 소스를 사용합니다.'></div>"
+        f"<div><label>Render 서비스 ID</label><input name='render_service_id' value='{esc(COMPLAINTS_API_IMPORT_DEFAULT_SERVICE_ID)}' placeholder='srv-...'></div>"
+        "<label style='display:flex;align-items:center;gap:8px;'><input name='update_existing' type='checkbox' value='1' style='width:auto;'>이미 이관된 API-* 레코드도 덮어쓰기</label>"
+        "<label style='display:flex;align-items:center;gap:8px;'><input name='import_work_orders' type='checkbox' value='1' style='width:auto;'>민원과 함께 작업지시도 생성</label>"
         "<div class='row-actions'>"
         + "<button class='btn secondary' type='submit' name='action' value='inspect'>원본 확인</button>"
         + "<button class='btn secondary' type='submit' name='action' value='dry_run'>드라이런</button>"
-        + "<button class='btn warn' type='submit' name='action' value='apply' onclick=\"return confirm('현재 운영 DB에 레거시 민원을 실제 반영합니다. 계속하시겠습니까?');\">실제 이관</button>"
+        + "<button class='btn warn' type='submit' name='action' value='apply' onclick=\"return confirm('현재 운영 DB에 세대 민원 데이터를 실제 반영합니다. 계속하시겠습니까?');\">실제 이관</button>"
         + "</div></form></section>"
     )
 
 
-def _legacy_import_message(action: str, summary: dict) -> str:
+def _complaints_api_import_message(action: str, summary: dict) -> str:
     counts = summary.get("counts", {}) if isinstance(summary, dict) else {}
     if action == "inspect":
         return (
-            f"원본 확인: 작업 {summary.get('work_orders', 0)}건, 이벤트 {summary.get('work_order_events', 0)}건, "
-            f"상태 {summary.get('status_counts', {})}"
+            f"원본 확인: 민원 {summary.get('cases', 0)}건, 이력 {summary.get('events', 0)}건, "
+            f"문자 {summary.get('messages', 0)}건, 첨부 {summary.get('attachments', 0)}건"
         )
     if action == "apply":
         return (
             f"이관 완료: 민원 {counts.get('complaints_inserted', 0)}건, "
             f"이력 {counts.get('updates_inserted', 0)}건, "
+            f"문자이력 {counts.get('message_updates_inserted', 0)}건, "
             f"작업지시 {counts.get('work_orders_inserted', 0)}건"
         )
     return (
         f"드라이런: 민원 {counts.get('complaints_inserted', 0)}건, "
         f"이력 {counts.get('updates_inserted', 0)}건, "
+        f"문자이력 {counts.get('message_updates_inserted', 0)}건, "
         f"작업지시 {counts.get('work_orders_inserted', 0)}건 예정"
     )
 
@@ -4001,7 +4014,7 @@ def database_page(request: Request):
         )
         + "<div class='layout-2'>"
         + "<div class='stack'>"
-        + _legacy_import_panel()
+        + _complaints_api_import_panel()
         + info_box("주의", "sessions 삭제는 즉시 로그아웃 효과를 낼 수 있고, attachments 삭제는 연결된 파일 참조를 제거합니다.")
         + info_box("입력 방식", "현재 화면은 공통 CRUD 화면이라 외래키는 숫자 id로 직접 입력합니다.")
         + _db_render_form(selected_table, columns, edit_row)
@@ -4014,54 +4027,64 @@ def database_page(request: Request):
     return HTMLResponse(layout(title="DB 관리", body=body, user=user, flash_message=flash_message, flash_level=flash_level))
 
 
-@app.post("/admin/legacy-import")
-async def admin_legacy_import(request: Request):
+@app.post("/admin/complaints-api-import")
+async def admin_complaints_api_import(request: Request):
     user, error = _authorize(request, "db:raw:edit")
     if error:
         return error
 
     form = await request.form()
     action = str(form.get("action", "dry_run")).strip().lower()
-    legacy_db_url = str(form.get("legacy_db_url", "")).strip() or LEGACY_IMPORT_DEFAULT_DB_URL
-    render_service_id = str(form.get("render_service_id", "")).strip() or LEGACY_IMPORT_DEFAULT_SERVICE_ID
+    base_url = str(form.get("base_url", "")).strip() or COMPLAINTS_API_IMPORT_DEFAULT_BASE_URL
+    site = str(form.get("site", "")).strip() or COMPLAINTS_API_IMPORT_DEFAULT_SITE
+    admin_token = str(form.get("admin_token", "")).strip() or COMPLAINTS_API_IMPORT_DEFAULT_TOKEN
+    render_service_id = (
+        str(form.get("render_service_id", "")).strip() or COMPLAINTS_API_IMPORT_DEFAULT_SERVICE_ID
+    )
     update_existing = _bool_from_form(form.get("update_existing"))
-    import_work_orders = not _bool_from_form(form.get("skip_work_orders"))
+    import_work_orders = _bool_from_form(form.get("import_work_orders"))
 
     try:
-        from scripts import import_legacy_complaints as legacy_import  # pylint: disable=import-outside-toplevel
+        from scripts import import_legacy_complaints_api as complaints_import  # pylint: disable=import-outside-toplevel
 
-        resolved_url = legacy_import.resolve_legacy_database_url(legacy_db_url, render_service_id)
         backup_path = None
         if action == "inspect":
-            summary = legacy_import.inspect_legacy_database(resolved_url)
+            source_token = complaints_import.resolve_source_admin_token(admin_token, render_service_id)
+            summary = complaints_import.inspect_source_data(base_url, source_token, site)
         elif action == "apply":
             backup_path = _db_backup_snapshot("operations_pre_admin_legacy_import")
-            summary = legacy_import.import_legacy_data(
-                resolved_url,
+            source_token = complaints_import.resolve_source_admin_token(admin_token, render_service_id)
+            summary = complaints_import.import_api_data(
+                base_url,
+                source_token,
+                site,
                 ops_db.DB_PATH.resolve(),
                 dry_run=False,
                 update_existing=update_existing,
                 import_work_orders=import_work_orders,
-                limit=None,
+                default_user_id=int(user["id"]),
             )
         else:
-            summary = legacy_import.import_legacy_data(
-                resolved_url,
+            source_token = complaints_import.resolve_source_admin_token(admin_token, render_service_id)
+            summary = complaints_import.import_api_data(
+                base_url,
+                source_token,
+                site,
                 ops_db.DB_PATH.resolve(),
                 dry_run=True,
                 update_existing=update_existing,
                 import_work_orders=import_work_orders,
-                limit=None,
+                default_user_id=int(user["id"]),
             )
-        message = _legacy_import_message(action, summary)
+        message = _complaints_api_import_message(action, summary)
         if backup_path:
             message += f" / 백업 {backup_path.name}"
         return _with_flash("/admin/database", message, "ok")
     except SystemExit as exc:
-        text = str(exc).strip() or "레거시 이관 실행 중 종료되었습니다."
+        text = str(exc).strip() or "민원 API 이관 실행 중 종료되었습니다."
         return _with_flash("/admin/database", text, "error")
     except Exception as exc:
-        return _with_flash("/admin/database", f"레거시 이관에 실패했습니다: {exc}", "error")
+        return _with_flash("/admin/database", f"민원 API 이관에 실패했습니다: {exc}", "error")
 
 
 @app.post("/admin/database/save")

@@ -43,12 +43,15 @@ def main() -> None:
         os.environ.pop("OPS_ADMIN_USERNAME", None)
         os.environ.pop("OPS_ADMIN_PASSWORD", None)
         os.environ.pop("OPS_ADMIN_NAME", None)
-        os.environ.pop("LEGACY_DATABASE_URL", None)
+        os.environ.pop("LEGACY_COMPLAINTS_API_BASE_URL", None)
+        os.environ.pop("LEGACY_COMPLAINTS_SITE", None)
+        os.environ.pop("LEGACY_ADMIN_TOKEN", None)
+        os.environ.pop("LEGACY_COMPLAINTS_RENDER_SERVICE_ID", None)
         os.environ.pop("LEGACY_RENDER_SERVICE_ID", None)
 
         import ops_main
         from ops import auth
-        from scripts import import_legacy_complaints as legacy_import
+        from scripts import import_legacy_complaints_api as complaints_import
 
         client = TestClient(ops_main.app)
 
@@ -76,23 +79,37 @@ def main() -> None:
 
         admin_page = client.get("/admin/database")
         expect(admin_page.status_code == 200, "관리자 DB 화면 접근에 실패했습니다.")
-        expect("레거시 민원 이관" in admin_page.text, "관리자 DB 화면에 레거시 민원 이관 패널이 없습니다.")
+        expect("세대 민원 API 이관" in admin_page.text, "관리자 DB 화면에 세대 민원 API 이관 패널이 없습니다.")
 
-        original_resolve = legacy_import.resolve_legacy_database_url
-        original_inspect = legacy_import.inspect_legacy_database
-        original_import = legacy_import.import_legacy_data
+        original_resolve = complaints_import.resolve_source_admin_token
+        original_inspect = complaints_import.inspect_source_data
+        original_import = complaints_import.import_api_data
         try:
-            legacy_import.resolve_legacy_database_url = lambda explicit_url, render_service_id: "postgresql://stub"
-            legacy_import.inspect_legacy_database = lambda url: {
-                "database": "legacy_stub",
-                "user": "stub_user",
-                "work_orders": 5,
-                "work_order_events": 11,
-                "status_counts": {"open": 2, "completed": 3},
+            complaints_import.resolve_source_admin_token = lambda explicit_token, render_service_id: "stub-token"
+            complaints_import.inspect_source_data = lambda base_url, admin_token, site: {
+                "base_url": base_url,
+                "site": site,
+                "cases": 5,
+                "events": 11,
+                "attachments": 0,
+                "messages": 2,
+                "cost_items": 0,
+                "status_counts": {"assigned": 4, "received": 1},
             }
 
-            def fake_import(url, target_db, *, dry_run, update_existing, import_work_orders, limit):
+            def fake_import(
+                base_url,
+                admin_token,
+                site,
+                target_db,
+                *,
+                dry_run,
+                update_existing,
+                import_work_orders,
+                default_user_id=None,
+            ):
                 return {
+                    "source": {"base_url": base_url, "site": site},
                     "target_db": str(target_db),
                     "dry_run": dry_run,
                     "import_work_orders": import_work_orders,
@@ -100,37 +117,55 @@ def main() -> None:
                     "counts": {
                         "complaints_inserted": 5 if dry_run else 3,
                         "updates_inserted": 11 if dry_run else 7,
+                        "message_updates_inserted": 2 if dry_run else 1,
                         "work_orders_inserted": 5 if import_work_orders else 0,
                     },
                 }
 
-            legacy_import.import_legacy_data = fake_import
+            complaints_import.import_api_data = fake_import
 
             inspect_resp = client.post(
-                "/admin/legacy-import",
-                data={"action": "inspect", "render_service_id": "srv-stub"},
+                "/admin/complaints-api-import",
+                data={"action": "inspect", "render_service_id": "srv-stub", "site": "연산더샵"},
                 follow_redirects=True,
             )
-            expect(inspect_resp.status_code == 200 and "원본 확인: 작업 5건, 이벤트 11건" in inspect_resp.text, "레거시 원본 확인 플로우가 비정상입니다.")
+            expect(
+                inspect_resp.status_code == 200
+                and "원본 확인: 민원 5건, 이력 11건, 문자 2건, 첨부 0건" in inspect_resp.text,
+                "민원 API 원본 확인 플로우가 비정상입니다.",
+            )
 
             dry_run_resp = client.post(
-                "/admin/legacy-import",
-                data={"action": "dry_run", "render_service_id": "srv-stub"},
+                "/admin/complaints-api-import",
+                data={"action": "dry_run", "render_service_id": "srv-stub", "site": "연산더샵"},
                 follow_redirects=True,
             )
-            expect(dry_run_resp.status_code == 200 and "드라이런: 민원 5건, 이력 11건, 작업지시 5건 예정" in dry_run_resp.text, "레거시 드라이런 플로우가 비정상입니다.")
+            expect(
+                dry_run_resp.status_code == 200
+                and "드라이런: 민원 5건, 이력 11건, 문자이력 2건, 작업지시 0건 예정" in dry_run_resp.text,
+                "민원 API 드라이런 플로우가 비정상입니다.",
+            )
 
             apply_resp = client.post(
-                "/admin/legacy-import",
-                data={"action": "apply", "render_service_id": "srv-stub"},
+                "/admin/complaints-api-import",
+                data={
+                    "action": "apply",
+                    "render_service_id": "srv-stub",
+                    "site": "연산더샵",
+                    "import_work_orders": "1",
+                },
                 follow_redirects=True,
             )
-            expect(apply_resp.status_code == 200 and "이관 완료: 민원 3건, 이력 7건, 작업지시 5건" in apply_resp.text, "레거시 실제 이관 플로우가 비정상입니다.")
-            expect((tmp_path / "backups").exists(), "레거시 실제 이관 전 백업이 생성되지 않았습니다.")
+            expect(
+                apply_resp.status_code == 200
+                and "이관 완료: 민원 3건, 이력 7건, 문자이력 1건, 작업지시 5건" in apply_resp.text,
+                "민원 API 실제 이관 플로우가 비정상입니다.",
+            )
+            expect((tmp_path / "backups").exists(), "민원 API 실제 이관 전 백업이 생성되지 않았습니다.")
         finally:
-            legacy_import.resolve_legacy_database_url = original_resolve
-            legacy_import.inspect_legacy_database = original_inspect
-            legacy_import.import_legacy_data = original_import
+            complaints_import.resolve_source_admin_token = original_resolve
+            complaints_import.inspect_source_data = original_inspect
+            complaints_import.import_api_data = original_import
 
         print("OK: stability flows verified")
     finally:
