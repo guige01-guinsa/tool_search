@@ -1192,12 +1192,14 @@ def _complaints_api_import_panel_with_state(import_state: dict[str, object] | No
         "<p class='muted'>ka-facility-os의 세대 민원 API(cases/events/messages)를 현재 민원 구조로 변환합니다.</p>"
         f"{info_box('기본 소스', source_hint)}"
         f"{info_box('기본 동작', '민원 본체와 처리 이력을 우선 이관합니다. 작업지시는 필요할 때만 생성하는 편이 안전합니다.')}"
+        f"{info_box('보호 모드', '운영 환경에서는 기본값으로 소스 API를 다시 호출하지 않습니다. 정말 필요할 때만 아래 체크를 켜고 실행하세요.')}"
         f"{state_box}"
         "<form action='/admin/complaints-api-import' method='post' class='stack'>"
         f"<div><label>소스 서비스 URL</label><input name='base_url' value='{esc(COMPLAINTS_API_IMPORT_DEFAULT_BASE_URL)}' placeholder='https://ka-facility-os.onrender.com'></div>"
         f"<div><label>site</label><input name='site' value='{esc(COMPLAINTS_API_IMPORT_DEFAULT_SITE)}' placeholder='예: 연산더샵'></div>"
         "<div><label>소스 X-Admin-Token (선택)</label><input name='admin_token' type='password' value='' autocomplete='off' placeholder='비워 두면 기본 소스를 사용합니다.'></div>"
         f"<div><label>Render 서비스 ID</label><input name='render_service_id' value='{esc(COMPLAINTS_API_IMPORT_DEFAULT_SERVICE_ID)}' placeholder='srv-...'></div>"
+        "<label style='display:flex;align-items:center;gap:8px;'><input name='allow_source_call' type='checkbox' value='1' style='width:auto;'>소스 API 재호출 허용</label>"
         "<label style='display:flex;align-items:center;gap:8px;'><input name='update_existing' type='checkbox' value='1' style='width:auto;'>이미 이관된 API-* 레코드도 덮어쓰기</label>"
         "<label style='display:flex;align-items:center;gap:8px;'><input name='import_work_orders' type='checkbox' value='1' style='width:auto;'>민원과 함께 작업지시도 생성</label>"
         "<div class='row-actions'>"
@@ -4349,6 +4351,7 @@ async def admin_complaints_api_import(request: Request):
     render_service_id = (
         str(form.get("render_service_id", "")).strip() or COMPLAINTS_API_IMPORT_DEFAULT_SERVICE_ID
     )
+    allow_source_call = _bool_from_form(form.get("allow_source_call"))
     update_existing = _bool_from_form(form.get("update_existing"))
     import_work_orders = _bool_from_form(form.get("import_work_orders"))
 
@@ -4357,6 +4360,21 @@ async def admin_complaints_api_import(request: Request):
         import_state = _complaints_api_import_state(conn)
         conn.close()
         imported_count = int(import_state.get("complaints") or 0)
+        if not allow_source_call:
+            if imported_count > 0:
+                message = (
+                    f"보호 모드로 소스 API 재호출을 막았습니다. 현재 저장값은 민원 {imported_count}건 / "
+                    f"이력 {int(import_state.get('updates') or 0)}건 / "
+                    f"문자이력 {int(import_state.get('message_updates') or 0)}건 / "
+                    f"작업지시 {int(import_state.get('work_orders') or 0)}건입니다. "
+                    "정말 다시 확인하거나 재이관해야 할 때만 '소스 API 재호출 허용'을 체크하세요."
+                )
+            else:
+                message = (
+                    "보호 모드로 소스 API 재호출을 막았습니다. "
+                    "초기 이관이나 원본 재확인이 꼭 필요할 때만 '소스 API 재호출 허용'을 체크하세요."
+                )
+            return _with_flash("/admin/database", message, "ok")
         if imported_count > 0 and not update_existing:
             message = (
                 f"이미 이관된 API 민원 {imported_count}건 / 이력 {int(import_state.get('updates') or 0)}건 / "

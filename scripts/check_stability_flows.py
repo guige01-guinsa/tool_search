@@ -90,6 +90,7 @@ def main() -> None:
         expect(admin_page.status_code == 200, "관리자 DB 화면 접근에 실패했습니다.")
         expect("세대 민원 API 이관" in admin_page.text, "관리자 DB 화면에 세대 민원 API 이관 패널이 없습니다.")
         expect("민원 화면에서 검색 버튼 옆 'PDF 출력'" in admin_page.text, "DB 화면의 PDF 안내가 없습니다.")
+        expect("소스 API 재호출 허용" in admin_page.text, "이관 보호 모드 체크박스가 없습니다.")
 
         original_resolve = complaints_import.resolve_source_admin_token
         original_inspect = complaints_import.inspect_source_data
@@ -136,7 +137,7 @@ def main() -> None:
 
             inspect_resp = client.post(
                 "/admin/complaints-api-import",
-                data={"action": "inspect", "render_service_id": "srv-stub", "site": "연산더샵"},
+                data={"action": "inspect", "render_service_id": "srv-stub", "site": "연산더샵", "allow_source_call": "1"},
                 follow_redirects=True,
             )
             expect(
@@ -147,7 +148,7 @@ def main() -> None:
 
             dry_run_resp = client.post(
                 "/admin/complaints-api-import",
-                data={"action": "dry_run", "render_service_id": "srv-stub", "site": "연산더샵"},
+                data={"action": "dry_run", "render_service_id": "srv-stub", "site": "연산더샵", "allow_source_call": "1"},
                 follow_redirects=True,
             )
             expect(
@@ -162,6 +163,7 @@ def main() -> None:
                     "action": "apply",
                     "render_service_id": "srv-stub",
                     "site": "연산더샵",
+                    "allow_source_call": "1",
                     "import_work_orders": "1",
                 },
                 follow_redirects=True,
@@ -236,7 +238,7 @@ def main() -> None:
                 follow_redirects=True,
             )
             expect(
-                locked_resp.status_code == 200 and "현재 데이터를 유지했습니다." in locked_resp.text,
+                locked_resp.status_code == 200 and "보호 모드로 소스 API 재호출을 막았습니다." in locked_resp.text,
                 "이미 이관된 데이터 보호 플로우가 비정상입니다.",
             )
         finally:
