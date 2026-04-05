@@ -5,7 +5,9 @@ import json
 import os
 import sqlite3
 import sys
+import time
 import urllib.parse
+import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -92,16 +94,29 @@ def _normalize_base_url(value: str) -> str:
 
 
 def _source_request_json(base_url: str, path: str, admin_token: str) -> Any:
-    request = urllib.request.Request(
-        f"{_normalize_base_url(base_url)}{path}",
-        headers={
-            "Accept": "application/json",
-            "X-Admin-Token": admin_token,
-            "User-Agent": "facility-ops-complaints-import/1.0",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        return json.load(response)
+    url = f"{_normalize_base_url(base_url)}{path}"
+    headers = {
+        "Accept": "application/json",
+        "X-Admin-Token": admin_token,
+        "User-Agent": "facility-ops-complaints-import/1.0",
+    }
+    last_error: Exception | None = None
+    for attempt in range(6):
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code not in {429, 500, 502, 503, 504}:
+                raise
+            retry_after = exc.headers.get("Retry-After", "").strip()
+            wait_seconds = float(retry_after) if retry_after.isdigit() else min(45.0, 2.5 * (attempt + 1))
+            time.sleep(wait_seconds)
+        except (urllib.error.URLError, TimeoutError) as exc:
+            last_error = exc
+            time.sleep(min(30.0, 2.0 * (attempt + 1)))
+    raise SystemExit(f"소스 민원 API 호출이 반복 실패했습니다: {last_error}")
 
 
 def _source_query(site: str, *, limit: int | None = None, record_type: str | None = None) -> str:
