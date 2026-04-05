@@ -20,11 +20,3 @@ services:
         value: 시스템 관리자
       - key: OPS_ADMIN_PASSWORD
         sync: false
-      - key: LEGACY_COMPLAINTS_API_BASE_URL
-        value: https://ka-facility-os.onrender.com
-      - key: LEGACY_COMPLAINTS_SITE
-        value: 연산더샵
-      - key: LEGACY_COMPLAINTS_RENDER_SERVICE_ID
-        value: srv-d6g57jbuibrs739g5mvg
-      - key: LEGACY_ADMIN_TOKEN
-        sync: false

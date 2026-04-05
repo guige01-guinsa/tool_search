@@ -35,7 +35,7 @@ uvicorn ops_main:app --host 0.0.0.0 --port $env:PORT
 
 ## 점검 / 테스트
 
-- 문법 점검: `python -m py_compile ops_main.py scripts\check_crud_flows.py scripts\check_stability_flows.py scripts\import_legacy_complaints_api.py`
+- 문법 점검: `python -m py_compile ops_main.py scripts\check_crud_flows.py scripts\check_stability_flows.py scripts\check_pdf_import_flows.py`
 - CRUD 회귀 점검: `python scripts/check_crud_flows.py`
 - 안정화 스모크 점검: `python scripts/check_stability_flows.py`
 - PDF 이관 점검: `python scripts/check_pdf_import_flows.py`
@@ -72,8 +72,6 @@ uvicorn ops_main:app --host 0.0.0.0 --port $env:PORT
 - 관리자 로그인 후 상단 `DB관리` 메뉴에서만 모든 운영 테이블을 raw DB 수준으로 조회·등록·수정·삭제 가능
 - 관리자 `DB관리` 화면에서 `민원 PDF 이관` 패널로 세대 민원 처리 현황 PDF를 바로 업로드해 민원/시설/작업지시로 변환 가능
 - 목록 화면에서 체크박스로 여러 행을 선택한 뒤 `선택 삭제`로 일괄 삭제 가능
-- `세대 민원 API 이관`은 한 번 `API-CM-*` 데이터가 들어오면 기본값으로 현재 데이터를 유지하고, `덮어쓰기`를 체크했을 때만 다시 소스 호출
-- 기본값은 `보호 모드`라서 `소스 API 재호출 허용`을 체크하지 않으면 원본 API를 다시 호출하지 않음
 - 대상 테이블: `users`, `sessions`, `facilities`, `inventory_items`, `inventory_transactions`, `complaints`, `complaint_updates`, `complaint_feedback`, `complaint_response_templates`, `work_orders`, `work_order_updates`, `attachments`
 
 ## 권한 분리
@@ -89,17 +87,6 @@ uvicorn ops_main:app --host 0.0.0.0 --port $env:PORT
 - `반복 민원 감지`: 같은 연락처 기준 최근 90일 내 유사 위치/분류 민원을 상세 화면과 보고서에서 표시
 - `만족도 기록`: 민원별 1~5점 만족도와 후속 연락일, 코멘트를 기록
 - `회신 템플릿`: 공통/분류별 회신 템플릿을 기본 제공하고 `DB관리 > complaint_response_templates`에서 수정 가능
-
-## 세대 민원 API 이관
-
-- `https://ka-facility-os.onrender.com/web/complaints`가 쓰는 민원 API를 현재 `complaints`, `complaint_updates`, `work_orders`로 옮기는 스크립트: `python scripts/import_legacy_complaints_api.py --site 연산더샵`
-- 원본 건수만 확인: `python scripts/import_legacy_complaints_api.py --site 연산더샵 --inspect`
-- 실제 쓰기 없이 드라이런: `python scripts/import_legacy_complaints_api.py --site 연산더샵`
-- 실제 이관 실행: `python scripts/import_legacy_complaints_api.py --site 연산더샵 --apply`
-- 기본값은 소스 서비스의 `ADMIN_TOKEN`을 `RENDER_API_KEY`로 읽어오며, 필요하면 `--admin-token` 또는 `LEGACY_ADMIN_TOKEN`으로 직접 지정할 수 있다.
-- `--import-work-orders`를 주면 민원과 함께 작업지시도 같이 생성한다.
-- 기존에 이미 들어간 `API-*` 코드가 있으면 기본은 건너뛰고, `--update-existing`일 때만 덮어쓴다.
-- 관리자 화면에서도 `DB관리 > 세대 민원 API 이관` 패널에서 `원본 확인`, `드라이런`, `실제 이관`을 실행할 수 있다.
 
 ## 세대 민원 PDF 이관
 
