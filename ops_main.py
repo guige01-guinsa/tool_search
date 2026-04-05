@@ -4476,7 +4476,6 @@ def database_page(request: Request):
     rows = conn.execute(f"SELECT * FROM {selected_table} ORDER BY id DESC LIMIT 100").fetchall()
     edit_row = conn.execute(f"SELECT * FROM {selected_table} WHERE id = ?", (edit_id,)).fetchone() if edit_id else None
     table_cards = _db_table_cards(conn, selected_table)
-    import_state = _complaints_api_import_state(conn)
     pdf_import_state = _complaints_pdf_import_state(conn)
     conn.close()
 
@@ -4490,7 +4489,6 @@ def database_page(request: Request):
         + "<div class='layout-2'>"
         + "<div class='stack'>"
         + _complaints_pdf_import_panel_with_state(pdf_import_state)
-        + _complaints_api_import_panel_with_state(import_state)
         + info_box("PDF 출력", "민원 PDF는 상단 메뉴의 민원 화면에서 검색 버튼 옆 'PDF 출력'으로 내려받습니다.")
         + info_box("주의", "sessions 삭제는 즉시 로그아웃 효과를 낼 수 있고, attachments 삭제는 연결된 파일 참조를 제거합니다.")
         + info_box("입력 방식", "현재 화면은 공통 CRUD 화면이라 외래키는 숫자 id로 직접 입력합니다.")

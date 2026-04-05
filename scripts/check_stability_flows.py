@@ -88,9 +88,9 @@ def main() -> None:
 
         admin_page = client.get("/admin/database")
         expect(admin_page.status_code == 200, "관리자 DB 화면 접근에 실패했습니다.")
-        expect("세대 민원 API 이관" in admin_page.text, "관리자 DB 화면에 세대 민원 API 이관 패널이 없습니다.")
+        expect("세대 민원 API 이관" not in admin_page.text, "관리자 DB 화면에 숨겨야 할 세대 민원 API 이관 패널이 보입니다.")
         expect("민원 화면에서 검색 버튼 옆 'PDF 출력'" in admin_page.text, "DB 화면의 PDF 안내가 없습니다.")
-        expect("소스 API 재호출 허용" in admin_page.text, "이관 보호 모드 체크박스가 없습니다.")
+        expect("민원 PDF 이관" in admin_page.text, "관리자 DB 화면에 민원 PDF 이관 패널이 없습니다.")
 
         original_resolve = complaints_import.resolve_source_admin_token
         original_inspect = complaints_import.inspect_source_data
