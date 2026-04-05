@@ -1131,16 +1131,68 @@ def _db_backup_snapshot(prefix: str) -> Path:
 
 
 def _complaints_api_import_panel() -> str:
+    return _complaints_api_import_panel_with_state(None)
+
+
+def _complaints_api_import_state(conn) -> dict[str, object]:
+    complaint_count = conn.execute(
+        "SELECT COUNT(*) AS count, MAX(updated_at) AS latest FROM complaints WHERE complaint_code LIKE 'API-CM-%'"
+    ).fetchone()
+    update_count = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM complaint_updates cu
+        JOIN complaints c ON c.id = cu.complaint_id
+        WHERE c.complaint_code LIKE 'API-CM-%'
+        """
+    ).fetchone()["count"]
+    message_count = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM complaint_updates cu
+        JOIN complaints c ON c.id = cu.complaint_id
+        WHERE c.complaint_code LIKE 'API-CM-%'
+          AND cu.update_type = '회신'
+        """
+    ).fetchone()["count"]
+    work_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM work_orders WHERE work_code LIKE 'API-WO-%'"
+    ).fetchone()["count"]
+    return {
+        "complaints": int(complaint_count["count"] or 0),
+        "updates": int(update_count or 0),
+        "message_updates": int(message_count or 0),
+        "work_orders": int(work_count or 0),
+        "latest": str(complaint_count["latest"] or "").strip(),
+    }
+
+
+def _complaints_api_import_panel_with_state(import_state: dict[str, object] | None) -> str:
     source_hint = (
         "소스 관리자 토큰을 비워 두면 Render 서비스에서 ADMIN_TOKEN을 읽어옵니다."
         if not COMPLAINTS_API_IMPORT_DEFAULT_TOKEN
         else "환경변수 LEGACY_ADMIN_TOKEN을 기본 사용합니다."
     )
+    imported_count = int((import_state or {}).get("complaints") or 0)
+    state_box = ""
+    if imported_count > 0:
+        latest = str((import_state or {}).get("latest") or "").strip()
+        latest_text = f"마지막 반영 {fmt_datetime(latest)}" if latest else "반영 시각 미상"
+        state_box = info_box(
+            "현재 이관 상태",
+            "이미 "
+            f"민원 {imported_count}건 / 이력 {int((import_state or {}).get('updates') or 0)}건 / "
+            f"문자이력 {int((import_state or {}).get('message_updates') or 0)}건 / "
+            f"작업지시 {int((import_state or {}).get('work_orders') or 0)}건이 저장되어 있습니다. "
+            "기본 동작은 현재 데이터를 유지하며, 덮어쓰기 체크 전에는 소스 API를 다시 호출하지 않습니다. "
+            + latest_text,
+        )
     return (
         "<section class='panel'><h2>세대 민원 API 이관</h2>"
         "<p class='muted'>ka-facility-os의 세대 민원 API(cases/events/messages)를 현재 민원 구조로 변환합니다.</p>"
         f"{info_box('기본 소스', source_hint)}"
         f"{info_box('기본 동작', '민원 본체와 처리 이력을 우선 이관합니다. 작업지시는 필요할 때만 생성하는 편이 안전합니다.')}"
+        f"{state_box}"
         "<form action='/admin/complaints-api-import' method='post' class='stack'>"
         f"<div><label>소스 서비스 URL</label><input name='base_url' value='{esc(COMPLAINTS_API_IMPORT_DEFAULT_BASE_URL)}' placeholder='https://ka-facility-os.onrender.com'></div>"
         f"<div><label>site</label><input name='site' value='{esc(COMPLAINTS_API_IMPORT_DEFAULT_SITE)}' placeholder='예: 연산더샵'></div>"
@@ -3337,6 +3389,9 @@ def complaints_page(request: Request):
     else:
         form_html = info_box("읽기 전용", "현재 계정은 민원 조회만 가능합니다. 등록과 수정은 작업자 이상 권한이 필요합니다.")
 
+    pdf_params = [(key, value) for key, value in [("q", q), ("status", status), ("channel", channel), ("priority", priority)] if value]
+    pdf_href = "/complaints/pdf" + (f"?{urlencode(pdf_params)}" if pdf_params else "")
+
     if complaints:
         rows_html = []
         for row in complaints:
@@ -3388,6 +3443,7 @@ def complaints_page(request: Request):
             f"<select name='channel'>{render_options(COMPLAINT_CHANNEL_OPTIONS, channel, blank_label='전체 채널')}</select>"
             f"<select name='priority'>{render_options(COMPLAINT_PRIORITY_OPTIONS, priority, blank_label='전체 우선도')}</select>"
             "<button class='btn secondary' type='submit'>검색</button>"
+            f"<a class='btn secondary' href='{esc(pdf_href)}' target='_blank' rel='noopener'>PDF 출력</a>"
             "</form></div>"
             "<table><thead><tr><th>번호</th><th>민원</th><th>위치</th><th>우선도/상태</th><th>담당/기한</th><th>연결 작업</th><th>관리</th></tr></thead>"
             f"<tbody>{''.join(rows_html)}</tbody></table></section>"
@@ -3396,8 +3452,6 @@ def complaints_page(request: Request):
         list_html = "<section class='panel'><h2>민원 목록</h2>" + empty_state("조건에 맞는 민원이 없습니다.") + "</section>"
 
     flash_message, flash_level = _flash_from_request(request)
-    pdf_params = [(key, value) for key, value in [("q", q), ("status", status), ("channel", channel), ("priority", priority)] if value]
-    pdf_href = "/complaints/pdf" + (f"?{urlencode(pdf_params)}" if pdf_params else "")
     body = (
         page_header(
             "Complaints",
@@ -4255,6 +4309,7 @@ def database_page(request: Request):
     rows = conn.execute(f"SELECT * FROM {selected_table} ORDER BY id DESC LIMIT 100").fetchall()
     edit_row = conn.execute(f"SELECT * FROM {selected_table} WHERE id = ?", (edit_id,)).fetchone() if edit_id else None
     table_cards = _db_table_cards(conn, selected_table)
+    import_state = _complaints_api_import_state(conn)
     conn.close()
 
     flash_message, flash_level = _flash_from_request(request)
@@ -4266,7 +4321,8 @@ def database_page(request: Request):
         )
         + "<div class='layout-2'>"
         + "<div class='stack'>"
-        + _complaints_api_import_panel()
+        + _complaints_api_import_panel_with_state(import_state)
+        + info_box("PDF 출력", "민원 PDF는 상단 메뉴의 민원 화면에서 검색 버튼 옆 'PDF 출력'으로 내려받습니다.")
         + info_box("주의", "sessions 삭제는 즉시 로그아웃 효과를 낼 수 있고, attachments 삭제는 연결된 파일 참조를 제거합니다.")
         + info_box("입력 방식", "현재 화면은 공통 CRUD 화면이라 외래키는 숫자 id로 직접 입력합니다.")
         + _db_render_form(selected_table, columns, edit_row)
@@ -4297,6 +4353,18 @@ async def admin_complaints_api_import(request: Request):
     import_work_orders = _bool_from_form(form.get("import_work_orders"))
 
     try:
+        conn = get_conn()
+        import_state = _complaints_api_import_state(conn)
+        conn.close()
+        imported_count = int(import_state.get("complaints") or 0)
+        if imported_count > 0 and not update_existing:
+            message = (
+                f"이미 이관된 API 민원 {imported_count}건 / 이력 {int(import_state.get('updates') or 0)}건 / "
+                f"문자이력 {int(import_state.get('message_updates') or 0)}건 / 작업지시 {int(import_state.get('work_orders') or 0)}건이 있어 "
+                "현재 데이터를 유지했습니다. 다시 가져오려면 '이미 이관된 API-* 레코드도 덮어쓰기'를 체크하세요."
+            )
+            return _with_flash("/admin/database", message, "ok")
+
         from scripts import import_legacy_complaints_api as complaints_import  # pylint: disable=import-outside-toplevel
 
         backup_path = None

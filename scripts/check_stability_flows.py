@@ -51,6 +51,7 @@ def main() -> None:
 
         import ops_main
         from ops import auth
+        from ops.db import get_conn
         from scripts import import_legacy_complaints_api as complaints_import
 
         client = TestClient(ops_main.app)
@@ -88,6 +89,7 @@ def main() -> None:
         admin_page = client.get("/admin/database")
         expect(admin_page.status_code == 200, "관리자 DB 화면 접근에 실패했습니다.")
         expect("세대 민원 API 이관" in admin_page.text, "관리자 DB 화면에 세대 민원 API 이관 패널이 없습니다.")
+        expect("민원 화면에서 검색 버튼 옆 'PDF 출력'" in admin_page.text, "DB 화면의 PDF 안내가 없습니다.")
 
         original_resolve = complaints_import.resolve_source_admin_token
         original_inspect = complaints_import.inspect_source_data
@@ -170,6 +172,73 @@ def main() -> None:
                 "민원 API 실제 이관 플로우가 비정상입니다.",
             )
             expect((tmp_path / "backups").exists(), "민원 API 실제 이관 전 백업이 생성되지 않았습니다.")
+
+            conn = get_conn()
+            conn.execute(
+                """
+                INSERT INTO complaints(
+                    complaint_code, channel, category_primary, category_secondary, facility_id, unit_label, location_detail,
+                    requester_name, requester_phone, requester_email, title, description, priority, status, response_due_at,
+                    resolved_at, closed_at, assignee_user_id, created_by, updated_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "API-CM-000001",
+                    "전화",
+                    "민원",
+                    "",
+                    None,
+                    "101동 101호",
+                    "연산더샵",
+                    "홍길동",
+                    "01012345678",
+                    "",
+                    "기존 이관 데이터",
+                    "소스 재호출 방지 검증",
+                    "보통",
+                    "배정완료",
+                    "",
+                    "",
+                    "",
+                    None,
+                    1,
+                    1,
+                    "2026-04-05 09:00:00",
+                    "2026-04-05 09:00:00",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO complaint_updates(
+                    complaint_id, update_type, status_from, status_to, message, is_public_note, created_by, created_at
+                ) VALUES (
+                    (SELECT id FROM complaints WHERE complaint_code = 'API-CM-000001'),
+                    '내부메모', '', '배정완료', '기존 이관 이력', 0, 1, '2026-04-05 09:00:00'
+                )
+                """
+            )
+            conn.commit()
+            conn.close()
+
+            complaints_import.resolve_source_admin_token = lambda explicit_token, render_service_id: (_ for _ in ()).throw(
+                AssertionError("이미 이관된 경우 소스 토큰을 다시 읽으면 안 됩니다.")
+            )
+            complaints_import.inspect_source_data = lambda base_url, admin_token, site: (_ for _ in ()).throw(
+                AssertionError("이미 이관된 경우 소스 inspect를 호출하면 안 됩니다.")
+            )
+            complaints_import.import_api_data = lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("이미 이관된 경우 소스 import를 호출하면 안 됩니다.")
+            )
+
+            locked_resp = client.post(
+                "/admin/complaints-api-import",
+                data={"action": "inspect", "render_service_id": "srv-stub", "site": "연산더샵"},
+                follow_redirects=True,
+            )
+            expect(
+                locked_resp.status_code == 200 and "현재 데이터를 유지했습니다." in locked_resp.text,
+                "이미 이관된 데이터 보호 플로우가 비정상입니다.",
+            )
         finally:
             complaints_import.resolve_source_admin_token = original_resolve
             complaints_import.inspect_source_data = original_inspect

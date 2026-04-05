@@ -183,6 +183,7 @@ def main() -> None:
             complaint_detail.status_code == 200 and "반복 민원 감지" in complaint_detail.text and repeat_title in complaint_detail.text,
             "반복 민원 감지 화면이 올바르게 표시되지 않습니다.",
         )
+        expect("PDF 출력" in complaint_detail.text, "민원 화면에 PDF 출력 버튼이 보이지 않습니다.")
         complaint_pdf = client.get("/complaints/pdf", params={"q": complaint_title})
         expect(
             complaint_pdf.status_code == 200
