@@ -183,6 +183,13 @@ def main() -> None:
             complaint_detail.status_code == 200 and "반복 민원 감지" in complaint_detail.text and repeat_title in complaint_detail.text,
             "반복 민원 감지 화면이 올바르게 표시되지 않습니다.",
         )
+        complaint_pdf = client.get("/complaints/pdf", params={"q": complaint_title})
+        expect(
+            complaint_pdf.status_code == 200
+            and complaint_pdf.headers.get("content-type", "").startswith("application/pdf")
+            and len(complaint_pdf.content) > 1000,
+            "민원 PDF 출력이 정상 동작하지 않습니다.",
+        )
 
         inventory_name = f"검증재고-{suffix}"
         inventory_create = client.post(

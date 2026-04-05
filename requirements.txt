@@ -3,3 +3,4 @@ uvicorn
 pillow
 python-multipart
 psycopg[binary]
+reportlab>=4.2,<5.0

@@ -4,6 +4,8 @@ import os
 import json
 import sqlite3
 import uuid
+from io import BytesIO
+from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, List
@@ -632,6 +634,271 @@ def _complaint_template_rows(conn, category_primary: str):
         """,
         (category,),
     ).fetchall()
+
+
+def _complaint_filter_sql(q: str = "", status: str = "", channel: str = "", priority: str = "") -> tuple[str, list]:
+    where = []
+    params: list = []
+    if q:
+        where.append(
+            "(c.complaint_code LIKE ? OR c.title LIKE ? OR c.description LIKE ? OR c.requester_name LIKE ? OR c.requester_phone LIKE ? OR c.unit_label LIKE ? OR c.location_detail LIKE ?)"
+        )
+        params.extend([f"%{q}%"] * 7)
+    if status:
+        where.append("c.status = ?")
+        params.append(status)
+    if channel:
+        where.append("c.channel = ?")
+        params.append(channel)
+    if priority:
+        where.append("c.priority = ?")
+        params.append(priority)
+    return ("WHERE " + " AND ".join(where) if where else ""), params
+
+
+def _fetch_complaint_rows(conn, q: str = "", status: str = "", channel: str = "", priority: str = ""):
+    where_sql, params = _complaint_filter_sql(q, status, channel, priority)
+    return conn.execute(
+        f"""
+        SELECT c.*, f.name AS facility_name, u.full_name AS assignee_name, COUNT(DISTINCT w.id) AS work_count,
+               cf.rating AS feedback_rating, cf.follow_up_at AS feedback_follow_up_at,
+               (
+                 SELECT COUNT(*)
+                 FROM complaints c2
+                 WHERE c2.id != c.id
+                   AND c.requester_phone != ''
+                   AND c2.requester_phone = c.requester_phone
+                   AND c2.created_at >= datetime('now', '-{COMPLAINT_REPEAT_WINDOW_DAYS} days')
+                   AND (
+                     (c.facility_id IS NOT NULL AND c2.facility_id = c.facility_id)
+                     OR (c.unit_label != '' AND c2.unit_label = c.unit_label)
+                     OR (c.location_detail != '' AND c2.location_detail = c.location_detail)
+                     OR (c.category_primary != '' AND c2.category_primary = c.category_primary)
+                   )
+               ) AS repeat_count
+        FROM complaints c
+        LEFT JOIN facilities f ON f.id = c.facility_id
+        LEFT JOIN users u ON u.id = c.assignee_user_id
+        LEFT JOIN work_orders w ON w.complaint_id = c.id
+        LEFT JOIN complaint_feedback cf ON cf.complaint_id = c.id
+        {where_sql}
+        GROUP BY c.id
+        ORDER BY CASE c.priority WHEN '긴급' THEN 1 WHEN '높음' THEN 2 WHEN '보통' THEN 3 ELSE 4 END,
+                 c.updated_at DESC, c.id DESC
+        """,
+        params,
+    ).fetchall()
+
+
+def _build_complaints_pdf(rows, *, q: str = "", status: str = "", channel: str = "", priority: str = "") -> bytes:
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import mm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    except ImportError as exc:
+        raise RuntimeError("PDF generator dependency not installed") from exc
+
+    font_name = "Helvetica"
+    for candidate in ("HYGothic-Medium", "HYSMyeongJo-Medium"):
+        try:
+            if candidate not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(UnicodeCIDFont(candidate))
+            font_name = candidate
+            break
+        except Exception:
+            continue
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "ComplaintPdfTitle",
+        parent=styles["Title"],
+        fontName=font_name,
+        fontSize=22,
+        leading=28,
+        textColor=colors.HexColor("#1f5a55"),
+        alignment=TA_CENTER,
+        spaceAfter=10,
+    )
+    subtitle_style = ParagraphStyle(
+        "ComplaintPdfSubtitle",
+        parent=styles["BodyText"],
+        fontName=font_name,
+        fontSize=10.5,
+        leading=15,
+        textColor=colors.HexColor("#3c4a57"),
+        alignment=TA_CENTER,
+        spaceAfter=8,
+    )
+    body_style = ParagraphStyle(
+        "ComplaintPdfBody",
+        parent=styles["BodyText"],
+        fontName=font_name,
+        fontSize=9,
+        leading=12,
+        textColor=colors.HexColor("#17212b"),
+    )
+    small_style = ParagraphStyle(
+        "ComplaintPdfSmall",
+        parent=body_style,
+        fontSize=8,
+        leading=10,
+        textColor=colors.HexColor("#60707d"),
+    )
+    cell_style = ParagraphStyle(
+        "ComplaintPdfCell",
+        parent=body_style,
+        fontSize=8.5,
+        leading=10,
+    )
+    header_style = ParagraphStyle(
+        "ComplaintPdfHeader",
+        parent=body_style,
+        fontSize=8.5,
+        leading=10,
+        textColor=colors.white,
+        alignment=TA_CENTER,
+    )
+
+    def para(text: str, style=body_style) -> Paragraph:
+        return Paragraph(esc(text or "-").replace("\n", "<br/>"), style)
+
+    result_count = len(rows)
+    location_values = sorted({str(row["location_detail"] or "").strip() for row in rows if str(row["location_detail"] or "").strip()})
+    site_label = location_values[0] if len(location_values) == 1 else ("복수 현장" if location_values else "전체")
+    status_counts = Counter(str(row["status"] or "미분류") for row in rows)
+    priority_counts = Counter(str(row["priority"] or "보통") for row in rows)
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    filter_summary = " / ".join(
+        [
+            f"검색어 {q}" if q else "검색어 전체",
+            f"상태 {status}" if status else "상태 전체",
+            f"채널 {channel}" if channel else "채널 전체",
+            f"우선도 {priority}" if priority else "우선도 전체",
+        ]
+    )
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=landscape(A4),
+        rightMargin=12 * mm,
+        leftMargin=12 * mm,
+        topMargin=12 * mm,
+        bottomMargin=12 * mm,
+        title="민원 처리 현황 보고",
+        author="시설 운영 시스템",
+    )
+    story = [
+        Paragraph("시설 운영 시스템", small_style),
+        Paragraph(f"{site_label} 민원 처리 현황 보고", title_style),
+        Paragraph(
+            f"생성 시각 {generated_at} · 출력 대상 {result_count}건 · {filter_summary}",
+            subtitle_style,
+        ),
+    ]
+
+    summary_table = Table(
+        [
+            [para("현장", body_style), para(site_label, body_style), para("현재 결과", body_style), para(f"{result_count}건", body_style)],
+            [para("상태 요약", body_style), para(", ".join(f"{key} {value}건" for key, value in status_counts.items()) or "-", small_style), para("우선도 요약", body_style), para(", ".join(f"{key} {value}건" for key, value in priority_counts.items()) or "-", small_style)],
+        ],
+        colWidths=[22 * mm, 86 * mm, 22 * mm, 124 * mm],
+    )
+    summary_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f7f3ea")),
+                ("BOX", (0, 0), (-1, -1), 0.7, colors.HexColor("#d8dfd5")),
+                ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#d8dfd5")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 7),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+            ]
+        )
+    )
+    story.extend([summary_table, Spacer(1, 6 * mm)])
+
+    table_rows = [
+        [
+            Paragraph("번호", header_style),
+            Paragraph("민원", header_style),
+            Paragraph("위치", header_style),
+            Paragraph("채널/분류", header_style),
+            Paragraph("우선/상태", header_style),
+            Paragraph("담당/기한", header_style),
+            Paragraph("연결작업", header_style),
+        ]
+    ]
+    for row in rows:
+        title_block = f"{row['title']}\n{row['requester_name'] or '-'} / {row['requester_phone'] or '-'}"
+        location_block = row["unit_label"] or row["location_detail"] or "-"
+        channel_block = f"{row['channel']}\n{row['category_primary'] or '-'}"
+        status_block = f"{row['priority']} / {row['status']}\nSLA {_complaint_sla_meta(row)[0]}"
+        assignee_block = f"{row['assignee_name'] or '미배정'}\n회신 목표 {fmt_date(row['response_due_at'])}"
+        table_rows.append(
+            [
+                para(str(row["complaint_code"]), cell_style),
+                para(title_block, cell_style),
+                para(location_block, cell_style),
+                para(channel_block, cell_style),
+                para(status_block, cell_style),
+                para(assignee_block, cell_style),
+                para(f"{row['work_count']}건", cell_style),
+            ]
+        )
+
+    if result_count == 0:
+        table_rows.append(
+            [
+                para("데이터 없음", cell_style),
+                para("조건에 맞는 민원이 없습니다.", cell_style),
+                para("-", cell_style),
+                para("-", cell_style),
+                para("-", cell_style),
+                para("-", cell_style),
+                para("-", cell_style),
+            ]
+        )
+
+    complaints_table = Table(
+        table_rows,
+        repeatRows=1,
+        colWidths=[28 * mm, 68 * mm, 38 * mm, 33 * mm, 31 * mm, 38 * mm, 18 * mm],
+    )
+    complaints_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f5a55")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.45, colors.HexColor("#d8dfd5")),
+                ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8faf7")]),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]
+        )
+    )
+    story.append(complaints_table)
+
+    def draw_page(canvas, document) -> None:
+        canvas.saveState()
+        canvas.setFont(font_name, 8)
+        canvas.setFillColor(colors.HexColor("#60707d"))
+        canvas.drawString(document.leftMargin, 8 * mm, "시설 운영 시스템 민원 PDF")
+        canvas.drawRightString(document.pagesize[0] - document.rightMargin, 8 * mm, f"{canvas.getPageNumber()}p")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=draw_page, onLaterPages=draw_page)
+    return buf.getvalue()
 
 
 DB_TABLE_LABELS = {
@@ -2718,54 +2985,7 @@ def complaints_page(request: Request):
     edit_id = _parse_int(request.query_params.get("edit", ""), 0)
 
     conn = get_conn()
-    where = []
-    params: list = []
-    if q:
-        where.append(
-            "(c.complaint_code LIKE ? OR c.title LIKE ? OR c.description LIKE ? OR c.requester_name LIKE ? OR c.requester_phone LIKE ? OR c.unit_label LIKE ? OR c.location_detail LIKE ?)"
-        )
-        params.extend([f"%{q}%"] * 7)
-    if status:
-        where.append("c.status = ?")
-        params.append(status)
-    if channel:
-        where.append("c.channel = ?")
-        params.append(channel)
-    if priority:
-        where.append("c.priority = ?")
-        params.append(priority)
-    where_sql = "WHERE " + " AND ".join(where) if where else ""
-
-    complaints = conn.execute(
-        f"""
-        SELECT c.*, f.name AS facility_name, u.full_name AS assignee_name, COUNT(DISTINCT w.id) AS work_count,
-               cf.rating AS feedback_rating, cf.follow_up_at AS feedback_follow_up_at,
-               (
-                 SELECT COUNT(*)
-                 FROM complaints c2
-                 WHERE c2.id != c.id
-                   AND c.requester_phone != ''
-                   AND c2.requester_phone = c.requester_phone
-                   AND c2.created_at >= datetime('now', '-{COMPLAINT_REPEAT_WINDOW_DAYS} days')
-                   AND (
-                     (c.facility_id IS NOT NULL AND c2.facility_id = c.facility_id)
-                     OR (c.unit_label != '' AND c2.unit_label = c.unit_label)
-                     OR (c.location_detail != '' AND c2.location_detail = c.location_detail)
-                     OR (c.category_primary != '' AND c2.category_primary = c.category_primary)
-                   )
-               ) AS repeat_count
-        FROM complaints c
-        LEFT JOIN facilities f ON f.id = c.facility_id
-        LEFT JOIN users u ON u.id = c.assignee_user_id
-        LEFT JOIN work_orders w ON w.complaint_id = c.id
-        LEFT JOIN complaint_feedback cf ON cf.complaint_id = c.id
-        {where_sql}
-        GROUP BY c.id
-        ORDER BY CASE c.priority WHEN '긴급' THEN 1 WHEN '높음' THEN 2 WHEN '보통' THEN 3 ELSE 4 END,
-                 c.updated_at DESC, c.id DESC
-        """,
-        params,
-    ).fetchall()
+    complaints = _fetch_complaint_rows(conn, q, status, channel, priority)
     attachments = _attachment_map(conn, "complaint", [row["id"] for row in complaints])
     edit_row = (
         conn.execute(
@@ -3176,11 +3396,14 @@ def complaints_page(request: Request):
         list_html = "<section class='panel'><h2>민원 목록</h2>" + empty_state("조건에 맞는 민원이 없습니다.") + "</section>"
 
     flash_message, flash_level = _flash_from_request(request)
+    pdf_params = [(key, value) for key, value in [("q", q), ("status", status), ("channel", channel), ("priority", priority)] if value]
+    pdf_href = "/complaints/pdf" + (f"?{urlencode(pdf_params)}" if pdf_params else "")
     body = (
         page_header(
             "Complaints",
             "민원 관리",
             "민원 접수, 분류, 배정, 회신, 작업지시 연결을 하나의 흐름으로 관리합니다.",
+            actions=f"<a class='btn secondary' href='{esc(pdf_href)}' target='_blank' rel='noopener'>PDF 출력</a>",
         )
         + "<div class='layout-2'>"
         + form_html
@@ -3188,6 +3411,35 @@ def complaints_page(request: Request):
         + "</div>"
     )
     return HTMLResponse(layout(title="민원 관리", body=body, user=user, flash_message=flash_message, flash_level=flash_level))
+
+
+@app.get("/complaints/pdf")
+def complaints_pdf(request: Request):
+    user, error = _authorize(request, "complaints:view")
+    if error:
+        return error
+
+    q = request.query_params.get("q", "").strip()
+    status = request.query_params.get("status", "").strip()
+    channel = request.query_params.get("channel", "").strip()
+    priority = request.query_params.get("priority", "").strip()
+
+    conn = get_conn()
+    complaint_rows = _fetch_complaint_rows(conn, q, status, channel, priority)
+    conn.close()
+    pdf_bytes = _build_complaints_pdf(
+        complaint_rows,
+        q=q,
+        status=status,
+        channel=channel,
+        priority=priority,
+    )
+    filename = f"complaints-report-{date.today().strftime('%Y%m%d')}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.post("/complaints/save")

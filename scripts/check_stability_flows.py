@@ -77,6 +77,14 @@ def main() -> None:
         )
         expect(login.status_code in {302, 303}, "관리자 로그인에 실패했습니다.")
 
+        complaints_pdf = client.get("/complaints/pdf")
+        expect(
+            complaints_pdf.status_code == 200
+            and complaints_pdf.headers.get("content-type", "").startswith("application/pdf")
+            and len(complaints_pdf.content) > 1000,
+            "민원 PDF 출력 응답이 비정상입니다.",
+        )
+
         admin_page = client.get("/admin/database")
         expect(admin_page.status_code == 200, "관리자 DB 화면 접근에 실패했습니다.")
         expect("세대 민원 API 이관" in admin_page.text, "관리자 DB 화면에 세대 민원 API 이관 패널이 없습니다.")
