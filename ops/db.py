@@ -79,6 +79,8 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS facilities (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             facility_code TEXT NOT NULL UNIQUE,
+            source_type TEXT NOT NULL DEFAULT '',
+            source_reference TEXT NOT NULL DEFAULT '',
             category TEXT NOT NULL DEFAULT '',
             name TEXT NOT NULL,
             building TEXT NOT NULL DEFAULT '',
@@ -147,6 +149,10 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS complaints (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             complaint_code TEXT NOT NULL UNIQUE,
+            batch_id INTEGER,
+            site_name TEXT NOT NULL DEFAULT '',
+            building_label TEXT NOT NULL DEFAULT '',
+            unit_number TEXT NOT NULL DEFAULT '',
             channel TEXT NOT NULL DEFAULT '전화',
             category_primary TEXT NOT NULL DEFAULT '',
             category_secondary TEXT NOT NULL DEFAULT '',
@@ -156,6 +162,9 @@ def init_db() -> None:
             requester_name TEXT NOT NULL DEFAULT '',
             requester_phone TEXT NOT NULL DEFAULT '',
             requester_email TEXT NOT NULL DEFAULT '',
+            external_assignee_name TEXT NOT NULL DEFAULT '',
+            source_type TEXT NOT NULL DEFAULT '',
+            source_reference TEXT NOT NULL DEFAULT '',
             title TEXT NOT NULL,
             description TEXT NOT NULL DEFAULT '',
             priority TEXT NOT NULL DEFAULT '보통',
@@ -241,7 +250,11 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS work_orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             work_code TEXT NOT NULL UNIQUE,
+            batch_id INTEGER,
             complaint_id INTEGER,
+            external_assignee_name TEXT NOT NULL DEFAULT '',
+            source_type TEXT NOT NULL DEFAULT '',
+            source_reference TEXT NOT NULL DEFAULT '',
             category TEXT NOT NULL DEFAULT '',
             title TEXT NOT NULL,
             facility_id INTEGER,
@@ -266,6 +279,53 @@ def init_db() -> None:
     )
 
     _ensure_column(conn, "work_orders", "complaint_id INTEGER", "complaint_id")
+    _ensure_column(conn, "facilities", "source_type TEXT NOT NULL DEFAULT ''", "source_type")
+    _ensure_column(conn, "facilities", "source_reference TEXT NOT NULL DEFAULT ''", "source_reference")
+    _ensure_column(conn, "complaints", "batch_id INTEGER", "batch_id")
+    _ensure_column(conn, "complaints", "site_name TEXT NOT NULL DEFAULT ''", "site_name")
+    _ensure_column(conn, "complaints", "building_label TEXT NOT NULL DEFAULT ''", "building_label")
+    _ensure_column(conn, "complaints", "unit_number TEXT NOT NULL DEFAULT ''", "unit_number")
+    _ensure_column(conn, "complaints", "external_assignee_name TEXT NOT NULL DEFAULT ''", "external_assignee_name")
+    _ensure_column(conn, "complaints", "source_type TEXT NOT NULL DEFAULT ''", "source_type")
+    _ensure_column(conn, "complaints", "source_reference TEXT NOT NULL DEFAULT ''", "source_reference")
+    _ensure_column(conn, "work_orders", "batch_id INTEGER", "batch_id")
+    _ensure_column(conn, "work_orders", "external_assignee_name TEXT NOT NULL DEFAULT ''", "external_assignee_name")
+    _ensure_column(conn, "work_orders", "source_type TEXT NOT NULL DEFAULT ''", "source_type")
+    _ensure_column(conn, "work_orders", "source_reference TEXT NOT NULL DEFAULT ''", "source_reference")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS complaint_import_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_code TEXT NOT NULL UNIQUE,
+            source_type TEXT NOT NULL DEFAULT '',
+            source_name TEXT NOT NULL DEFAULT '',
+            source_fingerprint TEXT NOT NULL UNIQUE,
+            site_name TEXT NOT NULL DEFAULT '',
+            report_title TEXT NOT NULL DEFAULT '',
+            document_type TEXT NOT NULL DEFAULT '',
+            recipient_name TEXT NOT NULL DEFAULT '',
+            submitter_name TEXT NOT NULL DEFAULT '',
+            contractor_name TEXT NOT NULL DEFAULT '',
+            project_name TEXT NOT NULL DEFAULT '',
+            report_date TEXT NOT NULL DEFAULT '',
+            report_generated_at TEXT NOT NULL DEFAULT '',
+            latest_received_at TEXT NOT NULL DEFAULT '',
+            total_complaints INTEGER NOT NULL DEFAULT 0,
+            household_count INTEGER NOT NULL DEFAULT 0,
+            open_count INTEGER NOT NULL DEFAULT 0,
+            closed_count INTEGER NOT NULL DEFAULT 0,
+            repeat_count INTEGER NOT NULL DEFAULT 0,
+            status_summary_json TEXT NOT NULL DEFAULT '',
+            building_summary_json TEXT NOT NULL DEFAULT '',
+            raw_payload TEXT NOT NULL DEFAULT '',
+            created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL
+        )
+        """
+    )
 
     conn.execute(
         """
@@ -304,10 +364,13 @@ def init_db() -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_inventory_location ON inventory_items(location)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_inventory_low ON inventory_items(quantity, min_quantity)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_inventory_tx_item ON inventory_transactions(item_id, created_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_facilities_source_reference ON facilities(source_reference)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_complaints_status ON complaints(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_complaints_due ON complaints(response_due_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_complaints_assignee ON complaints(assignee_user_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_complaints_requester_phone ON complaints(requester_phone)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_complaints_batch ON complaints(batch_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_complaints_site_building ON complaints(site_name, building_label, unit_number)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_complaint_updates_complaint ON complaint_updates(complaint_id, created_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_complaint_feedback_complaint ON complaint_feedback(complaint_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_complaint_feedback_rating ON complaint_feedback(rating, updated_at DESC)")
@@ -316,8 +379,21 @@ def init_db() -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_work_orders_due_date ON work_orders(due_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_work_orders_priority ON work_orders(priority)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_work_orders_complaint ON work_orders(complaint_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_work_orders_batch ON work_orders(batch_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_work_updates_work_order ON work_order_updates(work_order_id, created_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_entity ON attachments(entity_type, entity_id)")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_facilities_source_ref_unique ON facilities(source_reference) WHERE source_reference != ''"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_complaints_source_ref_unique ON complaints(source_reference) WHERE source_reference != ''"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_orders_source_ref_unique ON work_orders(source_reference) WHERE source_reference != ''"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_complaint_import_batches_fingerprint ON complaint_import_batches(source_fingerprint)"
+    )
 
     _seed_default_complaint_templates(conn)
     conn.commit()

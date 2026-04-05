@@ -7,6 +7,7 @@
 - 시설 관리
 - 재고 관리
 - 민원 관리
+- 세대 민원 PDF 이관
 - 민원 목록 PDF 출력
 - 민원 만족도 기록
 - 민원 SLA 경고 / 반복 민원 감지
@@ -37,6 +38,7 @@ uvicorn ops_main:app --host 0.0.0.0 --port $env:PORT
 - 문법 점검: `python -m py_compile ops_main.py scripts\check_crud_flows.py scripts\check_stability_flows.py scripts\import_legacy_complaints_api.py`
 - CRUD 회귀 점검: `python scripts/check_crud_flows.py`
 - 안정화 스모크 점검: `python scripts/check_stability_flows.py`
+- PDF 이관 점검: `python scripts/check_pdf_import_flows.py`
 
 ## 초기 관리자
 
@@ -68,6 +70,7 @@ uvicorn ops_main:app --host 0.0.0.0 --port $env:PORT
 ## DB 관리
 
 - 관리자 로그인 후 상단 `DB관리` 메뉴에서만 모든 운영 테이블을 raw DB 수준으로 조회·등록·수정·삭제 가능
+- 관리자 `DB관리` 화면에서 `민원 PDF 이관` 패널로 세대 민원 처리 현황 PDF를 바로 업로드해 민원/시설/작업지시로 변환 가능
 - 목록 화면에서 체크박스로 여러 행을 선택한 뒤 `선택 삭제`로 일괄 삭제 가능
 - `세대 민원 API 이관`은 한 번 `API-CM-*` 데이터가 들어오면 기본값으로 현재 데이터를 유지하고, `덮어쓰기`를 체크했을 때만 다시 소스 호출
 - 기본값은 `보호 모드`라서 `소스 API 재호출 허용`을 체크하지 않으면 원본 API를 다시 호출하지 않음
@@ -97,6 +100,14 @@ uvicorn ops_main:app --host 0.0.0.0 --port $env:PORT
 - `--import-work-orders`를 주면 민원과 함께 작업지시도 같이 생성한다.
 - 기존에 이미 들어간 `API-*` 코드가 있으면 기본은 건너뛰고, `--update-existing`일 때만 덮어쓴다.
 - 관리자 화면에서도 `DB관리 > 세대 민원 API 이관` 패널에서 `원본 확인`, `드라이런`, `실제 이관`을 실행할 수 있다.
+
+## 세대 민원 PDF 이관
+
+- 관리자 화면에서도 `DB관리 > 민원 PDF 이관` 패널에서 `드라이런`, `실제 이관`을 실행할 수 있다.
+- 로컬 파일 기준 CLI 실행: `python scripts/import_complaints_pdf.py c:\guige\pdf\분류_동호.pdf`
+- 실제 DB 반영: `python scripts/import_complaints_pdf.py c:\guige\pdf\분류_동호.pdf --apply`
+- 다른 DB 파일로 검증: `python scripts/import_complaints_pdf.py c:\guige\pdf\분류_동호.pdf --db .\tmp\operations.db --json`
+- PDF에서 `단지명`, `동/호`, `민원유형`, `상태`, `담당자`, `접수일시`, `연락처`, `민원내용`을 읽어 민원/시설/작업지시로 자동 매핑한다.
 
 ## Render 배포
 

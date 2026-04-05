@@ -15,7 +15,7 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from ops import auth, db as ops_db
+from ops import auth, db as ops_db, pdf_import
 from ops.db import get_conn, init_db, migrate_legacy_tools
 from ops.ui import (
     attachment_gallery,
@@ -610,7 +610,7 @@ def _complaint_repeat_candidates(conn, complaint_row, limit: int = 5):
 
     where.append("(" + " OR ".join(match_terms) + ")")
     sql = f"""
-        SELECT c.*, f.name AS facility_name, u.full_name AS assignee_name
+        SELECT c.*, f.name AS facility_name, COALESCE(u.full_name, c.external_assignee_name, '') AS assignee_name
         FROM complaints c
         LEFT JOIN facilities f ON f.id = c.facility_id
         LEFT JOIN users u ON u.id = c.assignee_user_id
@@ -636,14 +636,25 @@ def _complaint_template_rows(conn, category_primary: str):
     ).fetchall()
 
 
-def _complaint_filter_sql(q: str = "", status: str = "", channel: str = "", priority: str = "") -> tuple[str, list]:
+def _complaint_filter_sql(
+    q: str = "",
+    status: str = "",
+    channel: str = "",
+    priority: str = "",
+    site_name: str = "",
+    building_label: str = "",
+) -> tuple[str, list]:
     where = []
     params: list = []
     if q:
         where.append(
-            "(c.complaint_code LIKE ? OR c.title LIKE ? OR c.description LIKE ? OR c.requester_name LIKE ? OR c.requester_phone LIKE ? OR c.unit_label LIKE ? OR c.location_detail LIKE ?)"
+            "("
+            "c.complaint_code LIKE ? OR c.title LIKE ? OR c.description LIKE ? OR c.requester_name LIKE ? OR "
+            "c.requester_phone LIKE ? OR c.unit_label LIKE ? OR c.location_detail LIKE ? OR c.site_name LIKE ? OR "
+            "c.building_label LIKE ? OR c.unit_number LIKE ? OR c.category_secondary LIKE ? OR c.external_assignee_name LIKE ?"
+            ")"
         )
-        params.extend([f"%{q}%"] * 7)
+        params.extend([f"%{q}%"] * 12)
     if status:
         where.append("c.status = ?")
         params.append(status)
@@ -653,14 +664,28 @@ def _complaint_filter_sql(q: str = "", status: str = "", channel: str = "", prio
     if priority:
         where.append("c.priority = ?")
         params.append(priority)
+    if site_name:
+        where.append("c.site_name = ?")
+        params.append(site_name)
+    if building_label:
+        where.append("c.building_label = ?")
+        params.append(building_label)
     return ("WHERE " + " AND ".join(where) if where else ""), params
 
 
-def _fetch_complaint_rows(conn, q: str = "", status: str = "", channel: str = "", priority: str = ""):
-    where_sql, params = _complaint_filter_sql(q, status, channel, priority)
+def _fetch_complaint_rows(
+    conn,
+    q: str = "",
+    status: str = "",
+    channel: str = "",
+    priority: str = "",
+    site_name: str = "",
+    building_label: str = "",
+):
+    where_sql, params = _complaint_filter_sql(q, status, channel, priority, site_name, building_label)
     return conn.execute(
         f"""
-        SELECT c.*, f.name AS facility_name, u.full_name AS assignee_name, COUNT(DISTINCT w.id) AS work_count,
+        SELECT c.*, f.name AS facility_name, COALESCE(u.full_name, c.external_assignee_name, '') AS assignee_name, COUNT(DISTINCT w.id) AS work_count,
                cf.rating AS feedback_rating, cf.follow_up_at AS feedback_follow_up_at,
                (
                  SELECT COUNT(*)
@@ -690,7 +715,16 @@ def _fetch_complaint_rows(conn, q: str = "", status: str = "", channel: str = ""
     ).fetchall()
 
 
-def _build_complaints_pdf(rows, *, q: str = "", status: str = "", channel: str = "", priority: str = "") -> bytes:
+def _build_complaints_pdf(
+    rows,
+    *,
+    q: str = "",
+    status: str = "",
+    channel: str = "",
+    priority: str = "",
+    site_name: str = "",
+    building_label: str = "",
+) -> bytes:
     try:
         from reportlab.lib import colors
         from reportlab.lib.enums import TA_CENTER
@@ -768,8 +802,9 @@ def _build_complaints_pdf(rows, *, q: str = "", status: str = "", channel: str =
         return Paragraph(esc(text or "-").replace("\n", "<br/>"), style)
 
     result_count = len(rows)
-    location_values = sorted({str(row["location_detail"] or "").strip() for row in rows if str(row["location_detail"] or "").strip()})
-    site_label = location_values[0] if len(location_values) == 1 else ("복수 현장" if location_values else "전체")
+    site_values = sorted({str(row["site_name"] or "").strip() for row in rows if str(row["site_name"] or "").strip()})
+    building_values = Counter(str(row["building_label"] or "미상").strip() or "미상" for row in rows)
+    site_label = site_name or (site_values[0] if len(site_values) == 1 else ("복수 현장" if site_values else "전체"))
     status_counts = Counter(str(row["status"] or "미분류") for row in rows)
     priority_counts = Counter(str(row["priority"] or "보통") for row in rows)
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -779,6 +814,8 @@ def _build_complaints_pdf(rows, *, q: str = "", status: str = "", channel: str =
             f"상태 {status}" if status else "상태 전체",
             f"채널 {channel}" if channel else "채널 전체",
             f"우선도 {priority}" if priority else "우선도 전체",
+            f"단지 {site_name}" if site_name else "단지 전체",
+            f"동 {building_label}" if building_label else "동 전체",
         ]
     )
     buf = BytesIO()
@@ -805,6 +842,7 @@ def _build_complaints_pdf(rows, *, q: str = "", status: str = "", channel: str =
         [
             [para("현장", body_style), para(site_label, body_style), para("현재 결과", body_style), para(f"{result_count}건", body_style)],
             [para("상태 요약", body_style), para(", ".join(f"{key} {value}건" for key, value in status_counts.items()) or "-", small_style), para("우선도 요약", body_style), para(", ".join(f"{key} {value}건" for key, value in priority_counts.items()) or "-", small_style)],
+            [para("동 분포", body_style), para(", ".join(f"{key} {value}건" for key, value in building_values.most_common(8)) or "-", small_style), para("외부 배치", body_style), para("PDF 이관 민원 포함" if any(str(row["source_type"] or "").strip() == pdf_import.SOURCE_TYPE for row in rows) else "-", small_style)],
         ],
         colWidths=[22 * mm, 86 * mm, 22 * mm, 124 * mm],
     )
@@ -837,7 +875,8 @@ def _build_complaints_pdf(rows, *, q: str = "", status: str = "", channel: str =
     ]
     for row in rows:
         title_block = f"{row['title']}\n{row['requester_name'] or '-'} / {row['requester_phone'] or '-'}"
-        location_block = row["unit_label"] or row["location_detail"] or "-"
+        location_parts = [str(row["site_name"] or "").strip(), str(row["unit_label"] or "").strip() or str(row["location_detail"] or "").strip()]
+        location_block = "\n".join(part for part in location_parts if part) or "-"
         channel_block = f"{row['channel']}\n{row['category_primary'] or '-'}"
         status_block = f"{row['priority']} / {row['status']}\nSLA {_complaint_sla_meta(row)[0]}"
         assignee_block = f"{row['assignee_name'] or '미배정'}\n회신 목표 {fmt_date(row['response_due_at'])}"
@@ -905,6 +944,7 @@ DB_TABLE_LABELS = {
     "users": "사용자",
     "sessions": "세션",
     "facilities": "시설",
+    "complaint_import_batches": "민원 PDF 이관 배치",
     "inventory_items": "재고 항목",
     "inventory_transactions": "재고 수불 이력",
     "complaints": "민원",
@@ -1230,6 +1270,100 @@ def _complaints_api_import_message(action: str, summary: dict) -> str:
         f"문자이력 {counts.get('message_updates_inserted', 0)}건, "
         f"작업지시 {counts.get('work_orders_inserted', 0)}건 예정"
     )
+
+
+def _complaints_pdf_import_state(conn) -> dict[str, object]:
+    batch_count = conn.execute(
+        """
+        SELECT COUNT(*) AS count, MAX(updated_at) AS latest
+        FROM complaint_import_batches
+        WHERE source_type = ?
+        """,
+        (pdf_import.SOURCE_TYPE,),
+    ).fetchone()
+    complaint_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM complaints WHERE source_type = ?",
+        (pdf_import.SOURCE_TYPE,),
+    ).fetchone()["count"]
+    work_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM work_orders WHERE source_type = ?",
+        (pdf_import.SOURCE_TYPE,),
+    ).fetchone()["count"]
+    facility_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM facilities WHERE source_type = ?",
+        (pdf_import.SOURCE_TYPE,),
+    ).fetchone()["count"]
+    latest_batch = conn.execute(
+        """
+        SELECT batch_code, source_name, site_name, report_date, total_complaints, updated_at
+        FROM complaint_import_batches
+        WHERE source_type = ?
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 1
+        """,
+        (pdf_import.SOURCE_TYPE,),
+    ).fetchone()
+    return {
+        "batches": int(batch_count["count"] or 0),
+        "complaints": int(complaint_count or 0),
+        "work_orders": int(work_count or 0),
+        "facilities": int(facility_count or 0),
+        "latest": str(batch_count["latest"] or "").strip(),
+        "latest_batch": latest_batch,
+    }
+
+
+def _complaints_pdf_import_panel_with_state(import_state: dict[str, object] | None) -> str:
+    imported_count = int((import_state or {}).get("complaints") or 0)
+    latest_batch = (import_state or {}).get("latest_batch")
+    state_box = ""
+    if imported_count > 0:
+        latest_text = f"마지막 반영 {fmt_datetime((import_state or {}).get('latest') or '')}"
+        latest_batch_text = ""
+        if latest_batch:
+            latest_batch_text = (
+                f" 최근 배치 {esc(latest_batch['batch_code'])} / {esc(latest_batch['site_name'] or '단지 미상')} / "
+                f"{esc(latest_batch['source_name'])} / 원본 {int(latest_batch['total_complaints'] or 0)}건."
+            )
+        state_box = info_box(
+            "현재 PDF 이관 상태",
+            f"배치 {int((import_state or {}).get('batches') or 0)}개, 시설 {int((import_state or {}).get('facilities') or 0)}개, "
+            f"민원 {imported_count}건, 작업지시 {int((import_state or {}).get('work_orders') or 0)}건이 저장되어 있습니다. "
+            + latest_text
+            + "."
+            + latest_batch_text,
+        )
+    return (
+        "<section class='panel'><h2>민원 PDF 이관</h2>"
+        "<p class='muted'>세대 민원 처리 현황 보고 PDF를 올리면 단지/동별 민원, 시설, 작업지시를 현재 운영 DB 구조로 자동 변환합니다.</p>"
+        f"{info_box('권장 흐름', '먼저 드라이런으로 건수와 분류를 확인하고, 이상이 없을 때만 실제 이관을 실행하세요.')}"
+        f"{state_box}"
+        "<form action='/admin/complaints-pdf-import' method='post' enctype='multipart/form-data' class='stack'>"
+        "<div><label>PDF 파일</label><input name='pdf_file' type='file' accept='application/pdf,.pdf' required></div>"
+        "<label style='display:flex;align-items:center;gap:8px;'><input name='update_existing' type='checkbox' value='1' style='width:auto;'>같은 원본 민원(source_reference)도 다시 반영</label>"
+        "<label style='display:flex;align-items:center;gap:8px;'><input name='create_work_orders' type='checkbox' value='1' checked style='width:auto;'>민원과 함께 작업지시 자동 생성</label>"
+        "<div class='row-actions'>"
+        + "<button class='btn secondary' type='submit' name='action' value='dry_run'>드라이런</button>"
+        + "<button class='btn warn' type='submit' name='action' value='apply' onclick=\"return confirm('현재 운영 DB에 PDF 민원 데이터를 실제 반영합니다. 계속하시겠습니까?');\">실제 이관</button>"
+        + "</div></form></section>"
+    )
+
+
+def _complaints_pdf_import_message(action: str, summary: dict) -> str:
+    counts = summary.get("counts", {}) if isinstance(summary, dict) else {}
+    report = summary.get("report", {}) if isinstance(summary, dict) else {}
+    batch = summary.get("batch", {}) if isinstance(summary, dict) else {}
+    warnings = report.get("warnings", []) if isinstance(report, dict) else []
+    head = "PDF 이관 완료" if action == "apply" else "PDF 드라이런"
+    text = (
+        f"{head}: {report.get('site_name') or '단지 미상'} / 배치 {batch.get('batch_code') or '-'} / "
+        f"해석 {counts.get('parsed_complaints', 0)}건, 신규 민원 {counts.get('complaints_inserted', 0)}건, "
+        f"수정 {counts.get('complaints_updated', 0)}건, 유지 {counts.get('complaints_skipped', 0)}건, "
+        f"신규 시설 {counts.get('facilities_created', 0)}건, 신규 작업지시 {counts.get('work_orders_inserted', 0)}건"
+    )
+    if warnings:
+        text += f" / 경고 {len(warnings)}건"
+    return text
 
 
 def _can_manage_work_order(user, row) -> bool:
@@ -1795,7 +1929,7 @@ def dashboard(request: Request):
 
     recent_work_orders = conn.execute(
         """
-        SELECT w.*, f.name AS facility_name, u.full_name AS assignee_name
+        SELECT w.*, f.name AS facility_name, COALESCE(u.full_name, w.external_assignee_name, '') AS assignee_name
         FROM work_orders w
         LEFT JOIN facilities f ON f.id = w.facility_id
         LEFT JOIN users u ON u.id = w.assignee_user_id
@@ -1805,7 +1939,7 @@ def dashboard(request: Request):
     ).fetchall()
     recent_complaints = conn.execute(
         """
-        SELECT c.*, f.name AS facility_name, u.full_name AS assignee_name, COUNT(DISTINCT w.id) AS work_count,
+        SELECT c.*, f.name AS facility_name, COALESCE(u.full_name, c.external_assignee_name, '') AS assignee_name, COUNT(DISTINCT w.id) AS work_count,
                cf.rating AS feedback_rating,
                (
                  SELECT COUNT(*)
@@ -2624,7 +2758,7 @@ def work_orders_page(request: Request):
 
     orders = conn.execute(
         f"""
-        SELECT w.*, f.name AS facility_name, u.full_name AS assignee_name, c.complaint_code, c.title AS complaint_title
+        SELECT w.*, f.name AS facility_name, COALESCE(u.full_name, w.external_assignee_name, '') AS assignee_name, c.complaint_code, c.title AS complaint_title
         FROM work_orders w
         LEFT JOIN facilities f ON f.id = w.facility_id
         LEFT JOIN users u ON u.id = w.assignee_user_id
@@ -3036,15 +3170,17 @@ def complaints_page(request: Request):
     status = request.query_params.get("status", "").strip()
     channel = request.query_params.get("channel", "").strip()
     priority = request.query_params.get("priority", "").strip()
+    site_name = request.query_params.get("site", "").strip()
+    building_label = request.query_params.get("building", "").strip()
     edit_id = _parse_int(request.query_params.get("edit", ""), 0)
 
     conn = get_conn()
-    complaints = _fetch_complaint_rows(conn, q, status, channel, priority)
+    complaints = _fetch_complaint_rows(conn, q, status, channel, priority, site_name, building_label)
     attachments = _attachment_map(conn, "complaint", [row["id"] for row in complaints])
     edit_row = (
         conn.execute(
             """
-            SELECT c.*, f.name AS facility_name, u.full_name AS assignee_name,
+            SELECT c.*, f.name AS facility_name, COALESCE(u.full_name, c.external_assignee_name, '') AS assignee_name,
                    cf.id AS feedback_id, cf.rating AS feedback_rating, cf.comment AS feedback_comment, cf.follow_up_at
             FROM complaints c
             LEFT JOIN facilities f ON f.id = c.facility_id
@@ -3089,7 +3225,7 @@ def complaints_page(request: Request):
     linked_work_orders = (
         conn.execute(
             """
-            SELECT w.*, f.name AS facility_name, u.full_name AS assignee_name
+            SELECT w.*, f.name AS facility_name, COALESCE(u.full_name, w.external_assignee_name, '') AS assignee_name
             FROM work_orders w
             LEFT JOIN facilities f ON f.id = w.facility_id
             LEFT JOIN users u ON u.id = w.assignee_user_id
@@ -3105,6 +3241,18 @@ def complaints_page(request: Request):
     template_rows = _complaint_template_rows(conn, edit_row["category_primary"] if edit_row else "")
     facility_options = _facility_options(conn)
     assignee_options = _user_options(conn, include_viewers=False)
+    site_options = [
+        (str(row["site_name"]), str(row["site_name"]))
+        for row in conn.execute(
+            "SELECT DISTINCT site_name FROM complaints WHERE site_name != '' ORDER BY site_name ASC"
+        ).fetchall()
+    ]
+    building_options = [
+        (str(row["building_label"]), str(row["building_label"]))
+        for row in conn.execute(
+            "SELECT DISTINCT building_label FROM complaints WHERE building_label != '' ORDER BY building_label ASC"
+        ).fetchall()
+    ]
     conn.close()
 
     can_manage_edit_row = _can_manage_complaint(user, edit_row)
@@ -3391,7 +3539,18 @@ def complaints_page(request: Request):
     else:
         form_html = info_box("읽기 전용", "현재 계정은 민원 조회만 가능합니다. 등록과 수정은 작업자 이상 권한이 필요합니다.")
 
-    pdf_params = [(key, value) for key, value in [("q", q), ("status", status), ("channel", channel), ("priority", priority)] if value]
+    pdf_params = [
+        (key, value)
+        for key, value in [
+            ("q", q),
+            ("status", status),
+            ("channel", channel),
+            ("priority", priority),
+            ("site", site_name),
+            ("building", building_label),
+        ]
+        if value
+    ]
     pdf_href = "/complaints/pdf" + (f"?{urlencode(pdf_params)}" if pdf_params else "")
 
     if complaints:
@@ -3425,7 +3584,7 @@ def complaints_page(request: Request):
                     category=esc(row["category_primary"] or "-"),
                     requester=esc(f"{row['requester_name'] or '-'} / {row['requester_phone'] or '-'}"),
                     location=esc(row["unit_label"] or row["location_detail"] or "-"),
-                    facility=esc(row["facility_name"] or "시설 미지정"),
+                    facility=esc(" / ".join(part for part in [row["site_name"] or "", row["facility_name"] or "시설 미지정"] if part)),
                     priority=status_badge(row["priority"]),
                     status=status_badge(row["status"]),
                     sla=_complaint_sla_badge(row),
@@ -3440,10 +3599,12 @@ def complaints_page(request: Request):
         list_html = (
             "<section class='panel'><div class='split'><div><h2>민원 목록</h2><p class='muted'>접수부터 회신, 종결까지 민원 기준으로 추적합니다.</p></div>"
             "<form class='inline-form' method='get' action='/complaints'>"
-            f"<input name='q' value='{esc(q)}' placeholder='번호, 제목, 민원인, 연락처, 위치 검색'>"
+            f"<input name='q' value='{esc(q)}' placeholder='번호, 제목, 단지, 동/호, 연락처 검색'>"
             f"<select name='status'>{render_options(COMPLAINT_STATUS_OPTIONS, status, blank_label='전체 상태')}</select>"
             f"<select name='channel'>{render_options(COMPLAINT_CHANNEL_OPTIONS, channel, blank_label='전체 채널')}</select>"
             f"<select name='priority'>{render_options(COMPLAINT_PRIORITY_OPTIONS, priority, blank_label='전체 우선도')}</select>"
+            f"<select name='site'>{render_options(site_options, site_name, blank_label='전체 단지')}</select>"
+            f"<select name='building'>{render_options(building_options, building_label, blank_label='전체 동')}</select>"
             "<button class='btn secondary' type='submit'>검색</button>"
             f"<a class='btn secondary' href='{esc(pdf_href)}' target='_blank' rel='noopener'>PDF 출력</a>"
             "</form></div>"
@@ -3479,9 +3640,11 @@ def complaints_pdf(request: Request):
     status = request.query_params.get("status", "").strip()
     channel = request.query_params.get("channel", "").strip()
     priority = request.query_params.get("priority", "").strip()
+    site_name = request.query_params.get("site", "").strip()
+    building_label = request.query_params.get("building", "").strip()
 
     conn = get_conn()
-    complaint_rows = _fetch_complaint_rows(conn, q, status, channel, priority)
+    complaint_rows = _fetch_complaint_rows(conn, q, status, channel, priority, site_name, building_label)
     conn.close()
     pdf_bytes = _build_complaints_pdf(
         complaint_rows,
@@ -3489,6 +3652,8 @@ def complaints_pdf(request: Request):
         status=status,
         channel=channel,
         priority=priority,
+        site_name=site_name,
+        building_label=building_label,
     )
     filename = f"complaints-report-{date.today().strftime('%Y%m%d')}.pdf"
     return Response(
@@ -4312,6 +4477,7 @@ def database_page(request: Request):
     edit_row = conn.execute(f"SELECT * FROM {selected_table} WHERE id = ?", (edit_id,)).fetchone() if edit_id else None
     table_cards = _db_table_cards(conn, selected_table)
     import_state = _complaints_api_import_state(conn)
+    pdf_import_state = _complaints_pdf_import_state(conn)
     conn.close()
 
     flash_message, flash_level = _flash_from_request(request)
@@ -4323,6 +4489,7 @@ def database_page(request: Request):
         )
         + "<div class='layout-2'>"
         + "<div class='stack'>"
+        + _complaints_pdf_import_panel_with_state(pdf_import_state)
         + _complaints_api_import_panel_with_state(import_state)
         + info_box("PDF 출력", "민원 PDF는 상단 메뉴의 민원 화면에서 검색 버튼 옆 'PDF 출력'으로 내려받습니다.")
         + info_box("주의", "sessions 삭제는 즉시 로그아웃 효과를 낼 수 있고, attachments 삭제는 연결된 파일 참조를 제거합니다.")
@@ -4423,6 +4590,53 @@ async def admin_complaints_api_import(request: Request):
         return _with_flash("/admin/database", text, "error")
     except Exception as exc:
         return _with_flash("/admin/database", f"민원 API 이관에 실패했습니다: {exc}", "error")
+
+
+@app.post("/admin/complaints-pdf-import")
+async def admin_complaints_pdf_import(request: Request):
+    user, error = _authorize(request, "db:raw:edit")
+    if error:
+        return error
+
+    form = await request.form()
+    action = str(form.get("action", "dry_run")).strip().lower()
+    update_existing = _bool_from_form(form.get("update_existing"))
+    create_work_orders = _bool_from_form(form.get("create_work_orders"))
+    upload = form.get("pdf_file")
+    if not upload or not getattr(upload, "filename", ""):
+        return _with_flash("/admin/database", "이관할 PDF 파일을 선택해 주세요.", "error")
+
+    pdf_bytes = await upload.read()
+    if not pdf_bytes:
+        return _with_flash("/admin/database", "업로드된 PDF 파일이 비어 있습니다.", "error")
+
+    conn = get_conn()
+    backup_path = None
+    try:
+        if action == "apply":
+            backup_path = _db_backup_snapshot("operations_pre_pdf_import")
+        summary = pdf_import.import_complaints_pdf_bytes(
+            conn,
+            pdf_bytes,
+            source_name=upload.filename,
+            dry_run=action != "apply",
+            update_existing=update_existing,
+            create_work_orders=create_work_orders,
+            default_user_id=int(user["id"]),
+        )
+        if action == "apply":
+            conn.commit()
+        else:
+            conn.rollback()
+        message = _complaints_pdf_import_message(action, summary)
+        if backup_path:
+            message += f" / 백업 {backup_path.name}"
+        return _with_flash("/admin/database", message, "ok")
+    except Exception as exc:
+        conn.rollback()
+        return _with_flash("/admin/database", f"민원 PDF 이관에 실패했습니다: {exc}", "error")
+    finally:
+        conn.close()
 
 
 @app.post("/admin/database/save")
