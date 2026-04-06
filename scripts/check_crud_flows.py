@@ -23,10 +23,17 @@ SAMPLE_PNG = (
     b"\x00\x00\x00\x0cIDATx\x9cc\xf8\xff\xff?\x00\x05\xfe\x02\xfeA\xd9\x8f\x9b"
     b"\x00\x00\x00\x00IEND\xaeB`\x82"
 )
+SAMPLE_PDF = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
 
 
 def image_files(prefix: str, count: int) -> list[tuple[str, tuple[str, bytes, str]]]:
     return [("files", (f"{prefix}-{idx}.png", SAMPLE_PNG, "image/png")) for idx in range(count)]
+
+
+def office_files(prefix: str, image_count: int, pdf_count: int) -> list[tuple[str, tuple[str, bytes, str]]]:
+    files = [("files", (f"{prefix}-img-{idx}.png", SAMPLE_PNG, "image/png")) for idx in range(image_count)]
+    files.extend(("files", (f"{prefix}-doc-{idx}.pdf", SAMPLE_PDF, "application/pdf")) for idx in range(pdf_count))
+    return files
 
 
 def main() -> None:
@@ -254,6 +261,7 @@ def main() -> None:
                 "owner_user_id": "",
                 "due_date": "2026-03-31",
             },
+            files=office_files(f"office-{suffix}", 3, 3),
             follow_redirects=False,
         )
         expect(office_create.status_code in {302, 303}, "행정업무 등록 요청이 실패했습니다.")
@@ -262,6 +270,16 @@ def main() -> None:
         expect(office_row["contact_id"] == contact_id, "행정업무에 연락처 연결이 저장되지 않았습니다.")
         expect("테스트구청" in str(office_row["target_name"]), "행정업무 대상명이 연결 연락처 기준으로 자동 입력되지 않았습니다.")
         office_id = office_row["id"]
+        office_attachments = fetchall(
+            "SELECT original_name, file_path FROM attachments WHERE entity_type = 'office_record' AND entity_id = ? ORDER BY id ASC",
+            (office_id,),
+        )
+        expect(len(office_attachments) == 6, "행정업무 첨부 저장 개수가 올바르지 않습니다.")
+        expect(
+            any(str(row["original_name"]).endswith(".pdf") and str(row["file_path"]).endswith(".pdf") for row in office_attachments)
+            and any(str(row["original_name"]).endswith(".png") and str(row["file_path"]).endswith(".png") for row in office_attachments),
+            "행정업무 파일/이미지 첨부 확장자가 올바르게 저장되지 않았습니다.",
+        )
 
         office_page = client.get(f"/office-records?edit={office_id}")
         expect(
@@ -270,6 +288,7 @@ def main() -> None:
             and "gov@example.com" in office_page.text,
             "행정업무 수정 화면의 삭제 버튼 구조가 올바르지 않습니다.",
         )
+        expect("선택 첨부 삭제" in office_page.text and "첨부 파일 / 이미지 (최대 6개)" in office_page.text, "행정업무 첨부 관리 UI가 비정상입니다.")
 
         office_update = client.post(
             "/office-records/save",
@@ -297,6 +316,45 @@ def main() -> None:
             and office_row["contact_id"] == contact_id,
             "행정업무 수정이 반영되지 않았습니다.",
         )
+
+        office_over_limit = client.post(
+            f"/office-records/update/{office_id}",
+            data={"update_type": "메모", "body": "첨부 초과 시도", "status": ""},
+            files=office_files(f"office-over-{suffix}", 1, 0),
+            follow_redirects=False,
+        )
+        expect(office_over_limit.status_code in {302, 303}, "행정업무 첨부 초과 제한 응답이 비정상입니다.")
+        office_attachments = fetchall(
+            "SELECT id, original_name FROM attachments WHERE entity_type = 'office_record' AND entity_id = ? ORDER BY id ASC",
+            (office_id,),
+        )
+        expect(len(office_attachments) == 6, "행정업무 첨부 초과 시 파일이 추가 저장되면 안 됩니다.")
+
+        office_attachment_ids = [row["id"] for row in office_attachments[:2]]
+        office_delete_selected = client.post(
+            f"/office-records/attachments/delete/{office_id}",
+            data={"attachment_ids": [str(attachment_id) for attachment_id in office_attachment_ids]},
+            follow_redirects=False,
+        )
+        expect(office_delete_selected.status_code in {302, 303}, "행정업무 선택 첨부 삭제 요청이 실패했습니다.")
+        office_attachment_count = fetchone(
+            "SELECT COUNT(*) AS count FROM attachments WHERE entity_type = 'office_record' AND entity_id = ?",
+            (office_id,),
+        )["count"]
+        expect(office_attachment_count == 4, "행정업무 선택 첨부 삭제가 반영되지 않았습니다.")
+
+        office_refill = client.post(
+            f"/office-records/update/{office_id}",
+            data={"update_type": "메모", "body": "첨부 재업로드", "status": ""},
+            files=office_files(f"office-refill-{suffix}", 1, 1),
+            follow_redirects=False,
+        )
+        expect(office_refill.status_code in {302, 303}, "행정업무 첨부 재업로드 요청이 실패했습니다.")
+        office_attachment_count = fetchone(
+            "SELECT COUNT(*) AS count FROM attachments WHERE entity_type = 'office_record' AND entity_id = ?",
+            (office_id,),
+        )["count"]
+        expect(office_attachment_count == 6, "행정업무 첨부 삭제 후 재업로드가 반영되지 않았습니다.")
 
         office_progress = client.post(
             f"/office-records/update/{office_id}",

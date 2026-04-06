@@ -90,7 +90,12 @@ def main() -> None:
 
         office_records = client.get("/office-records")
         expect(office_records.status_code == 200, "행정업무 화면 접근에 실패했습니다.")
-        expect("기안지, 공문서, 정기점검" in office_records.text and "연결 연락처" in office_records.text, "행정업무 화면 설명이 비정상입니다.")
+        expect(
+            "기안지, 공문서, 정기점검" in office_records.text
+            and "연결 연락처" in office_records.text
+            and "첨부 파일 / 이미지 (최대 6개)" in office_records.text,
+            "행정업무 화면 설명이 비정상입니다.",
+        )
 
         reports = client.get("/reports")
         expect(reports.status_code == 200, "보고서 화면 접근에 실패했습니다.")
