@@ -71,6 +71,14 @@ def main() -> None:
         )
         expect(login.status_code in {302, 303}, "관리자 로그인에 실패했습니다.")
 
+        dashboard = client.get("/")
+        expect(dashboard.status_code == 200, "대시보드 접근에 실패했습니다.")
+        expect("행정업무" in dashboard.text, "대시보드에 행정업무 진입점이 없습니다.")
+
+        office_records = client.get("/office-records")
+        expect(office_records.status_code == 200, "행정업무 화면 접근에 실패했습니다.")
+        expect("기안지, 공문서, 정기점검" in office_records.text, "행정업무 화면 설명이 비정상입니다.")
+
         complaints_pdf = client.get("/complaints/pdf")
         expect(
             complaints_pdf.status_code == 200

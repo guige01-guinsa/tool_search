@@ -93,6 +93,67 @@ def main() -> None:
         facility_row = fetchone("SELECT * FROM facilities WHERE id = ?", (facility_id,))
         expect(facility_row["name"].endswith("-수정"), "시설 수정이 반영되지 않았습니다.")
 
+        office_title = f"검증행정업무-{suffix}"
+        office_create = client.post(
+            "/office-records/save",
+            data={
+                "record_type": "정기점검",
+                "title": office_title,
+                "facility_id": str(facility_id),
+                "target_name": "101동 소방설비",
+                "priority": "높음",
+                "status": "작성중",
+                "description": "행정업무 생성 검증",
+                "owner_user_id": "",
+                "due_date": "2026-03-31",
+            },
+            follow_redirects=False,
+        )
+        expect(office_create.status_code in {302, 303}, "행정업무 등록 요청이 실패했습니다.")
+        office_row = fetchone("SELECT * FROM office_records WHERE title = ?", (office_title,))
+        expect(office_row is not None, "행정업무가 생성되지 않았습니다.")
+        office_id = office_row["id"]
+
+        office_page = client.get(f"/office-records?edit={office_id}")
+        expect(
+            office_page.status_code == 200 and f"formaction='/office-records/delete/{office_id}'" in office_page.text,
+            "행정업무 수정 화면의 삭제 버튼 구조가 올바르지 않습니다.",
+        )
+
+        office_update = client.post(
+            "/office-records/save",
+            data={
+                "record_id": str(office_id),
+                "record_type": "공문서",
+                "title": f"{office_title}-수정",
+                "facility_id": str(facility_id),
+                "target_name": "구청 시설관리팀",
+                "priority": "긴급",
+                "status": "결재대기",
+                "description": "행정업무 수정 검증",
+                "owner_user_id": "",
+                "due_date": "2026-04-01",
+            },
+            follow_redirects=False,
+        )
+        expect(office_update.status_code in {302, 303}, "행정업무 수정 요청이 실패했습니다.")
+        office_row = fetchone("SELECT * FROM office_records WHERE id = ?", (office_id,))
+        expect(
+            office_row["title"].endswith("-수정") and office_row["record_type"] == "공문서" and office_row["priority"] == "긴급",
+            "행정업무 수정이 반영되지 않았습니다.",
+        )
+
+        office_progress = client.post(
+            f"/office-records/update/{office_id}",
+            data={"update_type": "상태변경", "body": "결재 상신 후 완료 처리", "status": "완료"},
+            follow_redirects=False,
+        )
+        expect(office_progress.status_code in {302, 303}, "행정업무 업데이트 요청이 실패했습니다.")
+        office_row = fetchone("SELECT * FROM office_records WHERE id = ?", (office_id,))
+        expect(office_row["status"] == "완료" and office_row["completed_at"], "행정업무 상태 업데이트가 반영되지 않았습니다.")
+        office_update_count = fetchone("SELECT COUNT(*) AS count FROM office_record_updates WHERE office_record_id = ?", (office_id,))["count"]
+        expect(office_update_count >= 3, "행정업무 이력이 충분히 생성되지 않았습니다.")
+
         complaint_title = f"검증민원-{suffix}"
         complaint_create = client.post(
             "/complaints/save",
@@ -451,6 +512,10 @@ def main() -> None:
         work_delete = client.post(f"/work-orders/delete/{work_id}", follow_redirects=False)
         expect(work_delete.status_code in {302, 303}, "작업지시 삭제 요청이 실패했습니다.")
         expect(fetchone("SELECT * FROM work_orders WHERE id = ?", (work_id,)) is None, "작업지시가 삭제되지 않았습니다.")
+
+        office_delete = client.post(f"/office-records/delete/{office_id}", follow_redirects=False)
+        expect(office_delete.status_code in {302, 303}, "행정업무 삭제 요청이 실패했습니다.")
+        expect(fetchone("SELECT * FROM office_records WHERE id = ?", (office_id,)) is None, "행정업무가 삭제되지 않았습니다.")
 
         facility_delete = client.post(f"/facilities/delete/{facility_id}", follow_redirects=False)
         expect(facility_delete.status_code in {302, 303}, "시설 삭제 요청이 실패했습니다.")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+from pathlib import Path
 from urllib.parse import quote
 
 from ops.auth import ROLE_LABELS, has_permission
@@ -74,21 +75,39 @@ def metric_card(label: str, value: str | int, note: str = "") -> str:
     )
 
 
-def attachment_gallery(attachments) -> str:
+def attachment_gallery(attachments, *, prefer_links: bool = False) -> str:
     if not attachments:
         return "<div class='muted'>첨부 없음</div>"
-    items = []
+    image_items = []
+    file_items = []
     for row in attachments:
         file_path = row["file_path"]
         href = f"/uploads/{quote(file_path)}"
-        items.append(
-            "<a class='thumb-link' target='_blank' href='"
+        original_name = row["original_name"] or file_path
+        extension = Path(str(original_name)).suffix.lower()
+        if not prefer_links and extension in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}:
+            image_items.append(
+                "<a class='thumb-link' target='_blank' href='"
+                + href
+                + "'><img class='thumb' src='"
+                + href
+                + "' alt='attachment'></a>"
+            )
+            continue
+        file_items.append(
+            "<a class='file-chip' target='_blank' href='"
             + href
-            + "'><img class='thumb' src='"
-            + href
-            + "' alt='attachment'></a>"
+            + "'>"
+            + esc(original_name)
+            + "</a>"
         )
-    return "<div class='thumb-grid'>" + "".join(items) + "</div>"
+
+    blocks = []
+    if image_items:
+        blocks.append("<div class='thumb-grid'>" + "".join(image_items) + "</div>")
+    if file_items:
+        blocks.append("<div class='file-list'>" + "".join(file_items) + "</div>")
+    return "<div class='attachment-stack'>" + "".join(blocks) + "</div>"
 
 
 def page_header(eyebrow: str, title: str, description: str, actions: str = "") -> str:
@@ -119,6 +138,7 @@ def nav_for_user(user) -> str:
         [
             ("/facilities", "시설", "facilities:view"),
             ("/inventory", "재고", "inventory:view"),
+            ("/office-records", "행정업무", "office_records:view"),
             ("/complaints", "민원", "complaints:view"),
             ("/work-orders", "작업지시", "work_orders:view"),
             ("/reports", "보고서", "reports:view"),
@@ -476,6 +496,28 @@ def layout(
       background: #f7f5ef;
     }}
     .thumb-link {{ display: inline-flex; }}
+    .attachment-stack {{
+      display: grid;
+      gap: 8px;
+      margin-top: 6px;
+    }}
+    .file-list {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }}
+    .file-chip {{
+      display: inline-flex;
+      align-items: center;
+      text-decoration: none;
+      border-radius: 999px;
+      padding: 7px 10px;
+      background: rgba(31, 90, 85, 0.08);
+      border: 1px solid rgba(31, 90, 85, 0.14);
+      color: var(--brand);
+      font-size: 12px;
+      font-weight: 700;
+    }}
     .stack {{
       display: grid;
       gap: 12px;

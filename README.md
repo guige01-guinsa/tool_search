@@ -6,6 +6,7 @@
 
 - 시설 관리
 - 재고 관리
+- 행정업무 관리 (`기안지 / 공문서 / 정기점검`)
 - 민원 관리
 - 세대 민원 PDF 이관
 - 민원 목록 PDF 출력
@@ -72,14 +73,14 @@ uvicorn ops_main:app --host 0.0.0.0 --port $env:PORT
 - 관리자 로그인 후 상단 `DB관리` 메뉴에서만 모든 운영 테이블을 raw DB 수준으로 조회·등록·수정·삭제 가능
 - 관리자 `DB관리` 화면에서 `민원 PDF 이관` 패널로 세대 민원 처리 현황 PDF를 바로 업로드해 민원/시설/작업지시로 변환 가능
 - 목록 화면에서 체크박스로 여러 행을 선택한 뒤 `선택 삭제`로 일괄 삭제 가능
-- 대상 테이블: `users`, `sessions`, `facilities`, `inventory_items`, `inventory_transactions`, `complaints`, `complaint_updates`, `complaint_feedback`, `complaint_response_templates`, `work_orders`, `work_order_updates`, `attachments`
+- 대상 테이블: `users`, `sessions`, `facilities`, `office_records`, `office_record_updates`, `inventory_items`, `inventory_transactions`, `complaints`, `complaint_updates`, `complaint_feedback`, `complaint_response_templates`, `work_orders`, `work_order_updates`, `attachments`
 
 ## 권한 분리
 
 - `admin`: 사용자 관리, raw DB 관리, 민원/시설/재고/작업지시 전체 관리
-- `manager`: 민원/시설/재고/작업지시 전체 관리, raw DB 직접 접근 불가
-- `technician`: 민원 접수, 본인 민원 업데이트, 만족도 기록, 재고 수불 처리, 작업지시 등록, 본인 생성 또는 본인 배정 작업지시 업데이트
-- `viewer`: 대시보드, 민원, 시설, 재고, 작업지시, 보고서 조회만 허용
+- `manager`: 민원/시설/재고/작업지시/행정업무 전체 관리, raw DB 직접 접근 불가
+- `technician`: 민원 접수, 본인 민원 업데이트, 만족도 기록, 재고 수불 처리, 작업지시 등록, 본인 생성 또는 본인 배정 작업지시 업데이트, 본인 행정업무 등록/업데이트
+- `viewer`: 대시보드, 민원, 시설, 재고, 작업지시, 행정업무, 보고서 조회만 허용
 
 ## 민원 2차 기능
 

@@ -278,6 +278,33 @@ def init_db() -> None:
         """
     )
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS office_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_code TEXT NOT NULL UNIQUE,
+            record_type TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL,
+            facility_id INTEGER,
+            target_name TEXT NOT NULL DEFAULT '',
+            priority TEXT NOT NULL DEFAULT '보통',
+            status TEXT NOT NULL DEFAULT '작성전',
+            description TEXT NOT NULL DEFAULT '',
+            owner_user_id INTEGER,
+            due_date TEXT NOT NULL DEFAULT '',
+            completed_at TEXT NOT NULL DEFAULT '',
+            created_by INTEGER,
+            updated_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            FOREIGN KEY(facility_id) REFERENCES facilities(id) ON DELETE SET NULL,
+            FOREIGN KEY(owner_user_id) REFERENCES users(id) ON DELETE SET NULL,
+            FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE SET NULL,
+            FOREIGN KEY(updated_by) REFERENCES users(id) ON DELETE SET NULL
+        )
+        """
+    )
+
     _ensure_column(conn, "work_orders", "complaint_id INTEGER", "complaint_id")
     _ensure_column(conn, "facilities", "source_type TEXT NOT NULL DEFAULT ''", "source_type")
     _ensure_column(conn, "facilities", "source_reference TEXT NOT NULL DEFAULT ''", "source_reference")
@@ -344,6 +371,21 @@ def init_db() -> None:
 
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS office_record_updates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            office_record_id INTEGER NOT NULL,
+            update_type TEXT NOT NULL,
+            body TEXT NOT NULL DEFAULT '',
+            actor_user_id INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            FOREIGN KEY(office_record_id) REFERENCES office_records(id) ON DELETE CASCADE,
+            FOREIGN KEY(actor_user_id) REFERENCES users(id) ON DELETE SET NULL
+        )
+        """
+    )
+
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS attachments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             entity_type TEXT NOT NULL,
@@ -381,6 +423,11 @@ def init_db() -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_work_orders_complaint ON work_orders(complaint_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_work_orders_batch ON work_orders(batch_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_work_updates_work_order ON work_order_updates(work_order_id, created_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_office_records_type ON office_records(record_type)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_office_records_status ON office_records(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_office_records_due_date ON office_records(due_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_office_records_owner ON office_records(owner_user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_office_updates_record ON office_record_updates(office_record_id, created_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_entity ON attachments(entity_type, entity_id)")
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_facilities_source_ref_unique ON facilities(source_reference) WHERE source_reference != ''"

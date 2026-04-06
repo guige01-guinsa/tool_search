@@ -81,6 +81,11 @@ COMPLAINT_RESOLVED_STATUSES = {"처리완료", "회신완료", "종결"}
 COMPLAINT_CLOSED_STATUSES = {"종결", "취소"}
 COMPLAINT_SLA_DAYS = {"긴급": 0, "높음": 1, "보통": 3, "낮음": 5}
 COMPLAINT_REPEAT_WINDOW_DAYS = 90
+OFFICE_RECORD_TYPE_OPTIONS = ["기안지", "공문서", "정기점검"]
+OFFICE_RECORD_STATUS_OPTIONS = ["작성전", "작성중", "검토중", "결재대기", "진행중", "완료", "보류"]
+OFFICE_RECORD_PRIORITY_OPTIONS = ["낮음", "보통", "높음", "긴급"]
+OFFICE_RECORD_UPDATE_TYPE_OPTIONS = ["메모", "상태변경", "결재", "발송", "점검결과", "완료보고"]
+OFFICE_RECORD_DONE_STATUSES = {"완료"}
 
 
 def _parse_int(value, default: int = 0) -> int:
@@ -935,6 +940,8 @@ DB_TABLE_LABELS = {
     "sessions": "세션",
     "facilities": "시설",
     "complaint_import_batches": "민원 PDF 이관 배치",
+    "office_records": "행정업무",
+    "office_record_updates": "행정업무 업데이트",
     "inventory_items": "재고 항목",
     "inventory_transactions": "재고 수불 이력",
     "complaints": "민원",
@@ -949,6 +956,7 @@ DB_MANAGED_TABLES = list(DB_TABLE_LABELS.keys())
 DB_TEXTAREA_COLUMNS = {"note", "body", "description", "reason", "specification", "message"}
 DB_CODE_FIELDS = {
     "facilities": ("facility_code", "FAC"),
+    "office_records": ("record_code", "ADM"),
     "inventory_items": ("item_code", "INV"),
     "complaints": ("complaint_code", "CP"),
     "complaint_response_templates": ("template_code", "CT"),
@@ -1304,6 +1312,62 @@ def _can_delete_complaint(user, row) -> bool:
     if not row:
         return False
     return int(row["created_by"] or 0) == int(user["id"])
+
+
+def _can_manage_office_record(user, row) -> bool:
+    if auth.has_permission(user["role"], "office_records:edit"):
+        return True
+    if not row:
+        return False
+    return int(row["created_by"] or 0) == int(user["id"])
+
+
+def _can_update_office_record(user, row) -> bool:
+    if auth.has_permission(user["role"], "office_records:edit"):
+        return True
+    if not auth.has_permission(user["role"], "office_records:update"):
+        return False
+    if not row:
+        return False
+    return int(row["created_by"] or 0) == int(user["id"]) or int(row["owner_user_id"] or 0) == int(user["id"])
+
+
+def _can_delete_office_record(user, row) -> bool:
+    if auth.has_permission(user["role"], "office_records:edit"):
+        return True
+    if not row:
+        return False
+    return int(row["created_by"] or 0) == int(user["id"])
+
+
+def _office_record_completed_at(status: str, existing_row=None) -> str:
+    completed_at = existing_row["completed_at"] if existing_row else ""
+    if status in OFFICE_RECORD_DONE_STATUSES:
+        return completed_at or _now_text()
+    return ""
+
+
+def _office_record_due_meta(row) -> tuple[str, str, str]:
+    due_date = _date_value(row["due_date"] if row else "")
+    if not due_date:
+        return "미설정", "warn", "기한이 아직 없습니다."
+    if row["status"] in OFFICE_RECORD_DONE_STATUSES:
+        return "완료", "good", f"기한 {due_date.strftime('%Y-%m-%d')}"
+
+    today = date.today()
+    remaining_days = (due_date - today).days
+    if remaining_days < 0:
+        return "지연", "danger", f"{abs(remaining_days)}일 초과"
+    if remaining_days == 0:
+        return "오늘 마감", "warn", "오늘 처리 예정입니다."
+    if remaining_days == 1:
+        return "임박", "warn", "1일 남았습니다."
+    return "정상", "good", f"{remaining_days}일 남았습니다."
+
+
+def _office_record_due_badge(row) -> str:
+    label, tone, _ = _office_record_due_meta(row)
+    return _badge(label, tone)
 
 
 def _complaint_timestamps(status: str, existing_row=None) -> tuple[str, str]:
@@ -1807,6 +1871,19 @@ def dashboard(request: Request):
         """,
         (_today_text(),),
     ).fetchone()["count"]
+    open_office_records = conn.execute(
+        "SELECT COUNT(*) AS count FROM office_records WHERE status NOT IN ('완료')"
+    ).fetchone()["count"]
+    overdue_office_records = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM office_records
+        WHERE due_date != ''
+          AND due_date < ?
+          AND status NOT IN ('완료')
+        """,
+        (_today_text(),),
+    ).fetchone()["count"]
     active_users = conn.execute(
         "SELECT COUNT(*) AS count FROM users WHERE is_active = 1"
     ).fetchone()["count"]
@@ -1853,6 +1930,16 @@ def dashboard(request: Request):
         LIMIT 8
         """
     ).fetchall()
+    recent_office_records = conn.execute(
+        """
+        SELECT r.*, f.name AS facility_name, u.full_name AS owner_name
+        FROM office_records r
+        LEFT JOIN facilities f ON f.id = r.facility_id
+        LEFT JOIN users u ON u.id = r.owner_user_id
+        ORDER BY r.updated_at DESC, r.id DESC
+        LIMIT 8
+        """
+    ).fetchall()
 
     recent_transactions = conn.execute(
         """
@@ -1873,6 +1960,7 @@ def dashboard(request: Request):
         + metric_card("진행 민원", open_complaints, f"회신 지연 {overdue_complaints}건")
         + metric_card("반복 민원", repeat_open_complaints, f"최근 {COMPLAINT_REPEAT_WINDOW_DAYS}일 기준")
         + metric_card("미완료 작업", open_work, f"지연 {overdue_work}건")
+        + metric_card("행정업무", open_office_records, f"기한 초과 {overdue_office_records}건")
         + metric_card("활성 사용자", active_users, f"오늘 완료 {today_completed}건")
         + metric_card("오늘 접수", today_received, f"SLA 오늘 마감 {due_today_complaints}건")
         + metric_card("만족도", feedback_stats["avg_rating"] or "-", f"피드백 {feedback_stats['count']}건 / 저평가 {int(feedback_stats['low_count'] or 0)}건")
@@ -1942,6 +2030,38 @@ def dashboard(request: Request):
     else:
         work_table = "<section class='panel'><h2>최근 작업지시</h2>" + empty_state("등록된 작업지시가 없습니다.") + "</section>"
 
+    if recent_office_records:
+        office_rows = "".join(
+            """
+            <tr>
+              <td>{code}</td>
+              <td><strong>{title}</strong><div class='muted'>{record_type}</div><div class='muted'>{target}</div></td>
+              <td>{priority}<div style='margin-top:6px'>{status}</div></td>
+              <td>{owner}</td>
+              <td>{due}<div style='margin-top:6px'>{due_badge}</div></td>
+            </tr>
+            """.format(
+                code=esc(row["record_code"]),
+                title=esc(row["title"]),
+                record_type=esc(row["record_type"] or "-"),
+                target=esc(row["target_name"] or row["facility_name"] or "-"),
+                priority=status_badge(row["priority"]),
+                status=status_badge(row["status"]),
+                owner=esc(row["owner_name"] or "미지정"),
+                due=esc(fmt_date(row["due_date"])),
+                due_badge=_office_record_due_badge(row),
+            )
+            for row in recent_office_records
+        )
+        office_table = (
+            "<section class='panel'><div class='split'><h2>최근 행정업무</h2>"
+            "<a class='btn secondary' href='/office-records'>전체 보기</a></div>"
+            "<table><thead><tr><th>번호</th><th>업무</th><th>우선도/상태</th><th>담당</th><th>기한</th></tr></thead>"
+            f"<tbody>{office_rows}</tbody></table></section>"
+        )
+    else:
+        office_table = "<section class='panel'><h2>최근 행정업무</h2>" + empty_state("등록된 행정업무가 없습니다.") + "</section>"
+
     if recent_transactions:
         tx_rows = "".join(
             """
@@ -1981,6 +2101,7 @@ def dashboard(request: Request):
             "9명까지 동시에 쓰는 환경을 기준으로 시설, 재고, 작업지시, 보고서를 한 흐름으로 묶었습니다.",
             actions=(
                 "<a class='btn primary' href='/work-orders'>작업지시 바로가기</a>"
+                "<a class='btn secondary' href='/office-records'>행정업무</a>"
                 "<a class='btn secondary' href='/reports'>운영 보고서</a>"
             ),
         )
@@ -1999,6 +2120,7 @@ def dashboard(request: Request):
         + "<div class='stack'>"
         + complaint_table
         + work_table
+        + office_table
         + tx_table
         + "</div></div>"
     )
@@ -2233,6 +2355,446 @@ def facilities_delete(request: Request, facility_id: int):
     conn.commit()
     conn.close()
     return _with_flash("/facilities", "시설이 삭제되었습니다.", "ok")
+
+
+@app.get("/office-records", response_class=HTMLResponse)
+def office_records_page(request: Request):
+    user, error = _authorize(request, "office_records:view")
+    if error:
+        return error
+
+    can_create = auth.has_permission(user["role"], "office_records:create")
+    q = request.query_params.get("q", "").strip()
+    record_type = request.query_params.get("record_type", "").strip()
+    status = request.query_params.get("status", "").strip()
+    priority = request.query_params.get("priority", "").strip()
+    edit_id = _parse_int(request.query_params.get("edit", ""), 0)
+
+    conn = get_conn()
+    where = []
+    params: list = []
+    if q:
+        where.append("(r.record_code LIKE ? OR r.title LIKE ? OR r.target_name LIKE ? OR r.description LIKE ?)")
+        params.extend([f"%{q}%"] * 4)
+    if record_type:
+        where.append("r.record_type = ?")
+        params.append(record_type)
+    if status:
+        where.append("r.status = ?")
+        params.append(status)
+    if priority:
+        where.append("r.priority = ?")
+        params.append(priority)
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+
+    rows = conn.execute(
+        f"""
+        SELECT r.*, f.name AS facility_name, u.full_name AS owner_name
+        FROM office_records r
+        LEFT JOIN facilities f ON f.id = r.facility_id
+        LEFT JOIN users u ON u.id = r.owner_user_id
+        {where_sql}
+        ORDER BY CASE WHEN r.status IN ('완료') THEN 1 ELSE 0 END,
+                 CASE WHEN r.due_date = '' THEN 1 ELSE 0 END,
+                 r.due_date ASC, r.updated_at DESC, r.id DESC
+        """,
+        params,
+    ).fetchall()
+    attachments = _attachment_map(conn, "office_record", [row["id"] for row in rows])
+    edit_row = (
+        conn.execute(
+            """
+            SELECT r.*, f.name AS facility_name, u.full_name AS owner_name
+            FROM office_records r
+            LEFT JOIN facilities f ON f.id = r.facility_id
+            LEFT JOIN users u ON u.id = r.owner_user_id
+            WHERE r.id = ?
+            """,
+            (edit_id,),
+        ).fetchone()
+        if edit_id
+        else None
+    )
+    updates = (
+        conn.execute(
+            """
+            SELECT ou.*, u.full_name AS actor_name
+            FROM office_record_updates ou
+            LEFT JOIN users u ON u.id = ou.actor_user_id
+            WHERE ou.office_record_id = ?
+            ORDER BY ou.created_at DESC, ou.id DESC
+            LIMIT 20
+            """,
+            (edit_id,),
+        ).fetchall()
+        if edit_id
+        else []
+    )
+    facility_options = _facility_options(conn)
+    owner_options = _user_options(conn, include_viewers=False)
+    conn.close()
+
+    can_manage_edit_row = _can_manage_office_record(user, edit_row)
+    can_update_edit_row = _can_update_office_record(user, edit_row)
+    can_delete_edit_row = _can_delete_office_record(user, edit_row)
+
+    signal_html = ""
+    if edit_row:
+        due_label, due_tone, due_note = _office_record_due_meta(edit_row)
+        signal_html = (
+            "<div class='grid two' style='margin:14px 0;'>"
+            + "<div style='border:1px solid rgba(23,33,43,0.08); border-radius:18px; padding:14px; background:#fff;'>"
+            + "<label>업무 구분</label>"
+            + f"<div>{_badge(edit_row['record_type'] or '미분류', 'neutral')} {status_badge(edit_row['status'])}</div>"
+            + f"<div class='muted' style='margin-top:8px'>{esc(edit_row['target_name'] or '대상 / 수신처 미입력')}</div>"
+            + "</div>"
+            + "<div style='border:1px solid rgba(23,33,43,0.08); border-radius:18px; padding:14px; background:#fff;'>"
+            + "<label>기한 신호</label>"
+            + f"<div>{_badge(due_label, due_tone)}</div><div class='muted' style='margin-top:8px'>{esc(due_note)}</div>"
+            + "</div></div>"
+        )
+
+    form_html = ""
+    if can_create or edit_row:
+        if edit_row and not (can_manage_edit_row or can_update_edit_row):
+            form_html = signal_html + info_box("권한 제한", "이 행정업무는 본인 등록 건이나 본인 담당 건일 때만 수정 또는 업데이트할 수 있습니다.")
+        elif edit_row and not can_manage_edit_row:
+            form_html = (
+                "<section class='panel'><h2>행정업무 상세</h2><p class='muted'>기본정보 수정 권한은 없고, 진행 업데이트만 가능합니다.</p>"
+                + signal_html
+                + "<div class='stack'>"
+                + info_box("관리번호", esc(edit_row["record_code"]))
+                + info_box("제목", esc(edit_row["title"]))
+                + info_box("대상 / 수신처", esc(edit_row["target_name"] or "-"))
+                + info_box("업무 내용", esc(edit_row["description"] or "-"))
+                + "</div>"
+            )
+            form_html += "<div style='margin-top:14px'><label>현재 첨부</label>" + attachment_gallery(attachments.get(edit_row["id"], []), prefer_links=True) + "</div></section>"
+        else:
+            form_html = (
+                "<section class='panel'><h2>행정업무 등록 / 수정</h2><p class='muted'>기안지, 공문서, 정기점검의 일정과 첨부 파일, 담당자, 진행 상태를 함께 관리합니다.</p>"
+                + signal_html
+                + "<form action='/office-records/save' method='post' enctype='multipart/form-data' class='stack'>"
+                + f"<input type='hidden' name='record_id' value='{esc(edit_row['id'] if edit_row else '')}'>"
+                + (
+                    f"<div><label>관리번호</label><input value='{esc(edit_row['record_code'])}' disabled></div>"
+                    if edit_row
+                    else ""
+                )
+                + f"<div><label>업무 구분</label><select name='record_type'>{render_options(OFFICE_RECORD_TYPE_OPTIONS, edit_row['record_type'] if edit_row else '', blank_label='선택')}</select></div>"
+                + f"<div><label>제목</label><input name='title' value='{esc(edit_row['title'] if edit_row else '')}' required></div>"
+                + "<div class='grid two'>"
+                + f"<div><label>연결 시설</label><select name='facility_id'>{render_options(facility_options, str(edit_row['facility_id'] or '') if edit_row else '', blank_label='미지정')}</select></div>"
+                + f"<div><label>대상 / 수신처</label><input name='target_name' value='{esc(edit_row['target_name'] if edit_row else '')}' placeholder='예: 관리사무소 / 101동 소방설비'></div>"
+                + "</div>"
+                + "<div class='grid two'>"
+                + f"<div><label>우선도</label><select name='priority'>{render_options(OFFICE_RECORD_PRIORITY_OPTIONS, edit_row['priority'] if edit_row else '보통')}</select></div>"
+                + f"<div><label>상태</label><select name='status'>{render_options(OFFICE_RECORD_STATUS_OPTIONS, edit_row['status'] if edit_row else '작성전')}</select></div>"
+                + "</div>"
+                + "<div class='grid two'>"
+                + f"<div><label>담당자</label><select name='owner_user_id'>{render_options(owner_options, str(edit_row['owner_user_id'] or '') if edit_row else '', blank_label='미지정')}</select></div>"
+                + f"<div><label>기한</label><input name='due_date' type='date' value='{esc(str(edit_row['due_date'] or '')[:10] if edit_row else '')}'></div>"
+                + "</div>"
+                + f"<div><label>업무 내용</label><textarea name='description'>{esc(edit_row['description'] if edit_row else '')}</textarea></div>"
+                + "<div><label>첨부 파일</label><input name='files' type='file' accept='.pdf,.hwp,.hwpx,.doc,.docx,.xls,.xlsx,image/*' multiple></div>"
+                + "<div class='row-actions'>"
+                + "<button class='btn primary' type='submit'>저장</button>"
+                + "<a class='btn secondary' href='/office-records'>새로 입력</a>"
+                + (
+                    _post_action_button(f"/office-records/delete/{edit_row['id']}", "삭제", "이 행정업무를 삭제하시겠습니까?")
+                    if edit_row and can_delete_edit_row
+                    else ""
+                )
+                + "</div></form>"
+            )
+            if edit_row:
+                form_html += "<div style='margin-top:14px'><label>현재 첨부</label>" + attachment_gallery(attachments.get(edit_row["id"], []), prefer_links=True) + "</div>"
+            form_html += "</section>"
+
+        if edit_row and can_update_edit_row:
+            updates_html = (
+                "".join(
+                    """
+                    <tr>
+                      <td>{when}</td>
+                      <td>{type}</td>
+                      <td>{body}</td>
+                      <td>{actor}</td>
+                    </tr>
+                    """.format(
+                        when=esc(fmt_datetime(row["created_at"])),
+                        type=status_badge(row["update_type"]),
+                        body=esc(row["body"] or "-"),
+                        actor=esc(row["actor_name"] or "system"),
+                    )
+                    for row in updates
+                )
+                if updates
+                else "<tr><td colspan='4' class='muted'>업데이트 이력이 없습니다.</td></tr>"
+            )
+            form_html += (
+                "<section class='panel' style='margin-top:16px;'><h2>진행 업데이트</h2><p class='muted'>결재 진행, 발송, 점검 결과 메모를 이력으로 남깁니다.</p>"
+                f"<form action='/office-records/update/{edit_row['id']}' method='post' enctype='multipart/form-data' class='stack'>"
+                + "<div class='grid two'>"
+                + f"<div><label>업데이트 유형</label><select name='update_type'>{render_options(OFFICE_RECORD_UPDATE_TYPE_OPTIONS, '메모')}</select></div>"
+                + f"<div><label>상태 변경</label><select name='status'>{render_options(OFFICE_RECORD_STATUS_OPTIONS, '', blank_label='상태 유지')}</select></div>"
+                + "</div>"
+                + "<div><label>업데이트 내용</label><textarea name='body' required></textarea></div>"
+                + "<div><label>추가 첨부</label><input name='files' type='file' accept='.pdf,.hwp,.hwpx,.doc,.docx,.xls,.xlsx,image/*' multiple></div>"
+                + "<div class='row-actions'><button class='btn warn' type='submit'>업데이트 저장</button></div>"
+                + "</form>"
+                + "<div style='margin-top:14px'><h3>최근 업데이트</h3>"
+                + "<table><thead><tr><th>시각</th><th>유형</th><th>내용</th><th>작성자</th></tr></thead>"
+                + f"<tbody>{updates_html}</tbody></table></div></section>"
+            )
+    else:
+        form_html = info_box("읽기 전용", "현재 계정은 행정업무 조회만 가능합니다. 등록과 수정은 작업자 이상 권한이 필요합니다.")
+
+    if rows:
+        rows_html = []
+        for row in rows:
+            row_actions = []
+            if _can_manage_office_record(user, row):
+                row_actions.append(f"<a class='btn secondary' href='/office-records?edit={row['id']}'>상세/수정</a>")
+            elif _can_update_office_record(user, row):
+                row_actions.append(f"<a class='btn secondary' href='/office-records?edit={row['id']}'>업데이트</a>")
+            else:
+                row_actions.append("<span class='muted'>조회</span>")
+            rows_html.append(
+                """
+                <tr>
+                  <td>{code}</td>
+                  <td><strong>{title}</strong><div class='muted'>{record_type}</div><div class='muted'>{target}</div><div class='muted'>{description}</div></td>
+                  <td>{facility}</td>
+                  <td>{priority}<div style='margin-top:6px'>{status}</div></td>
+                  <td>{owner}<div class='muted'>기한 {due}</div><div style='margin-top:6px'>{due_badge}</div></td>
+                  <td>{attachments}</td>
+                  <td>{actions}</td>
+                </tr>
+                """.format(
+                    code=esc(row["record_code"]),
+                    title=esc(row["title"]),
+                    record_type=esc(row["record_type"] or "-"),
+                    target=esc(row["target_name"] or "대상 / 수신처 미입력"),
+                    description=esc((row["description"] or "")[:80] + ("..." if len(row["description"] or "") > 80 else "")),
+                    facility=esc(row["facility_name"] or "시설 미지정"),
+                    priority=status_badge(row["priority"]),
+                    status=status_badge(row["status"]),
+                    owner=esc(row["owner_name"] or "미지정"),
+                    due=esc(fmt_date(row["due_date"])),
+                    due_badge=_office_record_due_badge(row),
+                    attachments=attachment_gallery(attachments.get(row["id"], []), prefer_links=True),
+                    actions="".join(row_actions),
+                )
+            )
+        list_html = (
+            "<section class='panel'><div class='split'><div><h2>행정업무 목록</h2><p class='muted'>기안지, 공문서, 정기점검 일정을 한 화면에서 관리합니다.</p></div>"
+            "<form class='inline-form' method='get' action='/office-records'>"
+            f"<input name='q' value='{esc(q)}' placeholder='번호, 제목, 대상, 내용 검색'>"
+            f"<select name='record_type'>{render_options(OFFICE_RECORD_TYPE_OPTIONS, record_type, blank_label='전체 구분')}</select>"
+            f"<select name='status'>{render_options(OFFICE_RECORD_STATUS_OPTIONS, status, blank_label='전체 상태')}</select>"
+            f"<select name='priority'>{render_options(OFFICE_RECORD_PRIORITY_OPTIONS, priority, blank_label='전체 우선도')}</select>"
+            "<button class='btn secondary' type='submit'>검색</button>"
+            "</form></div>"
+            "<table><thead><tr><th>번호</th><th>업무</th><th>시설</th><th>우선도/상태</th><th>담당/기한</th><th>첨부</th><th>관리</th></tr></thead>"
+            f"<tbody>{''.join(rows_html)}</tbody></table></section>"
+        )
+    else:
+        list_html = "<section class='panel'><h2>행정업무 목록</h2>" + empty_state("조건에 맞는 행정업무가 없습니다.") + "</section>"
+
+    flash_message, flash_level = _flash_from_request(request)
+    body = (
+        page_header(
+            "Office Records",
+            "행정업무 관리",
+            "기안지, 공문서, 정기점검의 일정과 첨부 파일, 담당자, 진행 상태를 함께 관리합니다.",
+        )
+        + "<div class='layout-2'>"
+        + form_html
+        + list_html
+        + "</div>"
+    )
+    return HTMLResponse(layout(title="행정업무 관리", body=body, user=user, flash_message=flash_message, flash_level=flash_level))
+
+
+@app.post("/office-records/save")
+def office_records_save(
+    request: Request,
+    record_id: str = Form(""),
+    record_type: str = Form(""),
+    title: str = Form(...),
+    facility_id: str = Form(""),
+    target_name: str = Form(""),
+    priority: str = Form("보통"),
+    status: str = Form("작성전"),
+    description: str = Form(""),
+    owner_user_id: str = Form(""),
+    due_date: str = Form(""),
+    files: List[UploadFile] = File(default=[]),
+):
+    user, error = _authorize(request, "office_records:view")
+    if error:
+        return error
+
+    record_id_i = _parse_int(record_id, 0)
+    facility_id_i = _parse_int(facility_id, 0) or None
+    owner_id_i = _parse_int(owner_user_id, 0) or None
+    completed_at = _office_record_completed_at(status)
+
+    conn = get_conn()
+    if record_id_i:
+        existing = conn.execute("SELECT * FROM office_records WHERE id = ?", (record_id_i,)).fetchone()
+        if not existing:
+            conn.close()
+            return _with_flash("/office-records", "행정업무를 찾을 수 없습니다.", "error")
+        if not _can_manage_office_record(user, existing):
+            conn.close()
+            return _with_flash(f"/office-records?edit={record_id_i}", "이 행정업무의 기본정보를 수정할 권한이 없습니다.", "error")
+        completed_at = _office_record_completed_at(status.strip(), existing)
+        conn.execute(
+            """
+            UPDATE office_records
+            SET record_type = ?, title = ?, facility_id = ?, target_name = ?, priority = ?, status = ?, description = ?,
+                owner_user_id = ?, due_date = ?, completed_at = ?, updated_by = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                record_type.strip(),
+                title.strip(),
+                facility_id_i,
+                target_name.strip(),
+                priority.strip(),
+                status.strip(),
+                description.strip(),
+                owner_id_i,
+                due_date.strip(),
+                completed_at,
+                user["id"],
+                _now_text(),
+                record_id_i,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO office_record_updates(office_record_id, update_type, body, actor_user_id, created_at)
+            VALUES (?, '기본정보수정', ?, ?, ?)
+            """,
+            (record_id_i, "행정업무 기본정보 수정", user["id"], _now_text()),
+        )
+        _save_attachments(conn, "office_record", record_id_i, files, user["id"])
+        conn.commit()
+        conn.close()
+        return _with_flash(f"/office-records?edit={record_id_i}", "행정업무가 수정되었습니다.", "ok")
+
+    if not auth.has_permission(user["role"], "office_records:create"):
+        conn.close()
+        return _with_flash("/office-records", "행정업무를 등록할 권한이 없습니다.", "error")
+
+    cursor = conn.execute(
+        """
+        INSERT INTO office_records(
+            record_code, record_type, title, facility_id, target_name, priority, status, description,
+            owner_user_id, due_date, completed_at, created_by, updated_by, created_at, updated_at
+        )
+        VALUES ('', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            record_type.strip(),
+            title.strip(),
+            facility_id_i,
+            target_name.strip(),
+            priority.strip(),
+            status.strip(),
+            description.strip(),
+            owner_id_i,
+            due_date.strip(),
+            completed_at,
+            user["id"],
+            user["id"],
+            _now_text(),
+            _now_text(),
+        ),
+    )
+    record_id_i = cursor.lastrowid
+    record_code = f"ADM-{record_id_i:04d}"
+    conn.execute("UPDATE office_records SET record_code = ? WHERE id = ?", (record_code, record_id_i))
+    conn.execute(
+        """
+        INSERT INTO office_record_updates(office_record_id, update_type, body, actor_user_id, created_at)
+        VALUES (?, '생성', ?, ?, ?)
+        """,
+        (record_id_i, "행정업무가 생성되었습니다.", user["id"], _now_text()),
+    )
+    _save_attachments(conn, "office_record", record_id_i, files, user["id"])
+    conn.commit()
+    conn.close()
+    return _with_flash(f"/office-records?edit={record_id_i}", "행정업무가 등록되었습니다.", "ok")
+
+
+@app.post("/office-records/update/{record_id}")
+def office_records_update(
+    request: Request,
+    record_id: int,
+    update_type: str = Form(...),
+    body: str = Form(...),
+    status: str = Form(""),
+    files: List[UploadFile] = File(default=[]),
+):
+    user, error = _authorize(request, "office_records:update")
+    if error:
+        return error
+
+    conn = get_conn()
+    record = conn.execute("SELECT * FROM office_records WHERE id = ?", (record_id,)).fetchone()
+    if not record:
+        conn.close()
+        return _with_flash("/office-records", "행정업무를 찾을 수 없습니다.", "error")
+    if not _can_update_office_record(user, record):
+        conn.close()
+        return _with_flash(f"/office-records?edit={record_id}", "이 행정업무를 업데이트할 권한이 없습니다.", "error")
+
+    new_status = status.strip() or record["status"]
+    completed_at = _office_record_completed_at(new_status, record)
+    conn.execute(
+        """
+        UPDATE office_records
+        SET status = ?, completed_at = ?, updated_by = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (new_status, completed_at, user["id"], _now_text(), record_id),
+    )
+    conn.execute(
+        """
+        INSERT INTO office_record_updates(office_record_id, update_type, body, actor_user_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (record_id, update_type.strip(), body.strip(), user["id"], _now_text()),
+    )
+    _save_attachments(conn, "office_record", record_id, files, user["id"])
+    conn.commit()
+    conn.close()
+    return _with_flash(f"/office-records?edit={record_id}", "행정업무 업데이트가 저장되었습니다.", "ok")
+
+
+@app.post("/office-records/delete/{record_id}")
+def office_records_delete(request: Request, record_id: int):
+    user, error = _authorize(request, "office_records:view")
+    if error:
+        return error
+    conn = get_conn()
+    record = conn.execute("SELECT * FROM office_records WHERE id = ?", (record_id,)).fetchone()
+    if not record:
+        conn.close()
+        return _with_flash("/office-records", "행정업무를 찾을 수 없습니다.", "error")
+    if not _can_delete_office_record(user, record):
+        conn.close()
+        return _with_flash(f"/office-records?edit={record_id}", "이 행정업무를 삭제할 권한이 없습니다.", "error")
+    _delete_attachments(conn, "office_record", record_id)
+    conn.execute("DELETE FROM office_record_updates WHERE office_record_id = ?", (record_id,))
+    conn.execute("DELETE FROM office_records WHERE id = ?", (record_id,))
+    conn.commit()
+    conn.close()
+    return _with_flash("/office-records", "행정업무가 삭제되었습니다.", "ok")
 
 
 @app.get("/inventory", response_class=HTMLResponse)
