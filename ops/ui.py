@@ -60,7 +60,7 @@ def status_badge(value: str) -> str:
         tone = "good"
     elif value in {"부족", "점검필요", "보류", "대기", "임박", "오늘 마감", "보통"}:
         tone = "warn"
-    elif value in {"긴급", "고장", "폐기대기", "사용중지", "비활성", "지연", "불만"}:
+    elif value in {"긴급", "고장", "폐기대기", "사용중지", "비활성", "지연", "불만", "종료"}:
         tone = "danger"
     return f"<span class='badge {tone}'>{text}</span>"
 
@@ -138,6 +138,7 @@ def nav_for_user(user) -> str:
         [
             ("/facilities", "시설", "facilities:view"),
             ("/inventory", "재고", "inventory:view"),
+            ("/contacts", "연락처", "contacts:view"),
             ("/office-records", "행정업무", "office_records:view"),
             ("/complaints", "민원", "complaints:view"),
             ("/work-orders", "작업지시", "work_orders:view"),

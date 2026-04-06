@@ -74,10 +74,15 @@ def main() -> None:
         dashboard = client.get("/")
         expect(dashboard.status_code == 200, "대시보드 접근에 실패했습니다.")
         expect("행정업무" in dashboard.text, "대시보드에 행정업무 진입점이 없습니다.")
+        expect("연락처" in dashboard.text, "대시보드에 연락처 진입점이 없습니다.")
+
+        contacts = client.get("/contacts")
+        expect(contacts.status_code == 200, "연락처 화면 접근에 실패했습니다.")
+        expect("업체연락처, 근무자연락처, 계약업체, 관공서" in contacts.text, "연락처 화면 설명이 비정상입니다.")
 
         office_records = client.get("/office-records")
         expect(office_records.status_code == 200, "행정업무 화면 접근에 실패했습니다.")
-        expect("기안지, 공문서, 정기점검" in office_records.text, "행정업무 화면 설명이 비정상입니다.")
+        expect("기안지, 공문서, 정기점검" in office_records.text and "연결 연락처" in office_records.text, "행정업무 화면 설명이 비정상입니다.")
 
         complaints_pdf = client.get("/complaints/pdf")
         expect(

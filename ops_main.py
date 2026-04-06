@@ -81,6 +81,8 @@ COMPLAINT_RESOLVED_STATUSES = {"처리완료", "회신완료", "종결"}
 COMPLAINT_CLOSED_STATUSES = {"종결", "취소"}
 COMPLAINT_SLA_DAYS = {"긴급": 0, "높음": 1, "보통": 3, "낮음": 5}
 COMPLAINT_REPEAT_WINDOW_DAYS = 90
+CONTACT_TYPE_OPTIONS = ["업체연락처", "근무자연락처", "계약업체", "관공서"]
+CONTACT_STATUS_OPTIONS = ["활성", "보류", "종료"]
 OFFICE_RECORD_TYPE_OPTIONS = ["기안지", "공문서", "정기점검"]
 OFFICE_RECORD_STATUS_OPTIONS = ["작성전", "작성중", "검토중", "결재대기", "진행중", "완료", "보류"]
 OFFICE_RECORD_PRIORITY_OPTIONS = ["낮음", "보통", "높음", "긴급"]
@@ -500,6 +502,70 @@ def _user_options(conn, *, include_viewers: bool = True) -> list[tuple[str, str]
     sql += " ORDER BY role ASC, full_name ASC"
     rows = conn.execute(sql, params).fetchall()
     return [(str(row["id"]), f"{row['full_name']} ({auth.ROLE_LABELS.get(row['role'], row['role'])})") for row in rows]
+
+
+def _contact_value(row, field: str, *, prefix: str = "") -> str:
+    if not row:
+        return ""
+    return str(row[f"{prefix}{field}"] or "").strip()
+
+
+def _contact_summary(row, *, prefix: str = "") -> str:
+    organization = _contact_value(row, "organization", prefix=prefix)
+    department = _contact_value(row, "department", prefix=prefix)
+    position = _contact_value(row, "position", prefix=prefix)
+    name = _contact_value(row, "name", prefix=prefix)
+
+    primary = organization or name
+    details = []
+    if department:
+        details.append(department)
+    if position:
+        details.append(position)
+    if organization and name and name != organization:
+        details.append(name)
+    if not primary:
+        return ""
+    return primary + (f" / {' / '.join(details)}" if details else "")
+
+
+def _contact_meta(row, *, prefix: str = "") -> str:
+    pieces = []
+    phone = _contact_value(row, "phone", prefix=prefix)
+    email = _contact_value(row, "email", prefix=prefix)
+    if phone:
+        pieces.append(phone)
+    if email:
+        pieces.append(email)
+    return " / ".join(pieces)
+
+
+def _contact_target_default(row, *, prefix: str = "") -> str:
+    summary = _contact_summary(row, prefix=prefix)
+    contact_type = _contact_value(row, "contact_type", prefix=prefix)
+    return f"{summary} ({contact_type})".strip() if summary and contact_type else summary
+
+
+def _contact_options(conn) -> list[tuple[str, str]]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM contacts
+        ORDER BY CASE WHEN status = '활성' THEN 0 WHEN status = '보류' THEN 1 ELSE 2 END,
+                 contact_type ASC, organization ASC, name ASC, id ASC
+        """
+    ).fetchall()
+    options = []
+    for row in rows:
+        summary = _contact_summary(row) or row["name"]
+        meta = _contact_meta(row)
+        label = f"{row['contact_type']} · {summary}"
+        if meta:
+            label += f" / {meta}"
+        if row["status"] != "활성":
+            label += f" ({row['status']})"
+        options.append((str(row["id"]), label))
+    return options
 
 
 def _complaint_options(conn) -> list[tuple[str, str]]:
@@ -939,6 +1005,7 @@ DB_TABLE_LABELS = {
     "users": "사용자",
     "sessions": "세션",
     "facilities": "시설",
+    "contacts": "연락처",
     "complaint_import_batches": "민원 PDF 이관 배치",
     "office_records": "행정업무",
     "office_record_updates": "행정업무 업데이트",
@@ -953,9 +1020,10 @@ DB_TABLE_LABELS = {
     "attachments": "첨부파일",
 }
 DB_MANAGED_TABLES = list(DB_TABLE_LABELS.keys())
-DB_TEXTAREA_COLUMNS = {"note", "body", "description", "reason", "specification", "message"}
+DB_TEXTAREA_COLUMNS = {"note", "body", "description", "reason", "specification", "message", "address"}
 DB_CODE_FIELDS = {
     "facilities": ("facility_code", "FAC"),
+    "contacts": ("contact_code", "CNT"),
     "office_records": ("record_code", "ADM"),
     "inventory_items": ("item_code", "INV"),
     "complaints": ("complaint_code", "CP"),
@@ -1314,6 +1382,18 @@ def _can_delete_complaint(user, row) -> bool:
     return int(row["created_by"] or 0) == int(user["id"])
 
 
+def _can_manage_contact(user, row) -> bool:
+    if auth.has_permission(user["role"], "contacts:edit"):
+        return True
+    if not row:
+        return False
+    return int(row["created_by"] or 0) == int(user["id"])
+
+
+def _can_delete_contact(user, row) -> bool:
+    return _can_manage_contact(user, row)
+
+
 def _can_manage_office_record(user, row) -> bool:
     if auth.has_permission(user["role"], "office_records:edit"):
         return True
@@ -1338,6 +1418,14 @@ def _can_delete_office_record(user, row) -> bool:
     if not row:
         return False
     return int(row["created_by"] or 0) == int(user["id"])
+
+
+def _office_record_target_name(conn, contact_id: int | None, raw_target_name: str) -> str:
+    target_name = str(raw_target_name or "").strip()
+    if target_name or not contact_id:
+        return target_name
+    row = conn.execute("SELECT * FROM contacts WHERE id = ?", (contact_id,)).fetchone()
+    return _contact_target_default(row)
 
 
 def _office_record_completed_at(status: str, existing_row=None) -> str:
@@ -2357,6 +2445,348 @@ def facilities_delete(request: Request, facility_id: int):
     return _with_flash("/facilities", "시설이 삭제되었습니다.", "ok")
 
 
+@app.get("/contacts", response_class=HTMLResponse)
+def contacts_page(request: Request):
+    user, error = _authorize(request, "contacts:view")
+    if error:
+        return error
+
+    can_create = auth.has_permission(user["role"], "contacts:create")
+    q = request.query_params.get("q", "").strip()
+    contact_type = request.query_params.get("contact_type", "").strip()
+    status = request.query_params.get("status", "").strip()
+    edit_id = _parse_int(request.query_params.get("edit", ""), 0)
+
+    conn = get_conn()
+    where = []
+    params: list = []
+    if q:
+        where.append(
+            "(c.contact_code LIKE ? OR c.name LIKE ? OR c.organization LIKE ? OR c.department LIKE ? OR c.position LIKE ? OR c.phone LIKE ? OR c.email LIKE ? OR c.note LIKE ?)"
+        )
+        params.extend([f"%{q}%"] * 8)
+    if contact_type:
+        where.append("c.contact_type = ?")
+        params.append(contact_type)
+    if status:
+        where.append("c.status = ?")
+        params.append(status)
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+
+    rows = conn.execute(
+        f"""
+        SELECT c.*, COUNT(DISTINCT r.id) AS office_record_count
+        FROM contacts c
+        LEFT JOIN office_records r ON r.contact_id = c.id
+        {where_sql}
+        GROUP BY c.id
+        ORDER BY CASE WHEN c.status = '활성' THEN 0 WHEN c.status = '보류' THEN 1 ELSE 2 END,
+                 c.contact_type ASC, c.organization ASC, c.name ASC, c.id DESC
+        """,
+        params,
+    ).fetchall()
+    edit_row = conn.execute("SELECT * FROM contacts WHERE id = ?", (edit_id,)).fetchone() if edit_id else None
+    linked_records = (
+        conn.execute(
+            """
+            SELECT id, record_code, record_type, title, status, due_date
+            FROM office_records
+            WHERE contact_id = ?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 10
+            """,
+            (edit_id,),
+        ).fetchall()
+        if edit_id
+        else []
+    )
+    conn.close()
+
+    can_manage_edit_row = _can_manage_contact(user, edit_row)
+    can_delete_edit_row = _can_delete_contact(user, edit_row)
+
+    if edit_row:
+        summary_text = _contact_summary(edit_row) or edit_row["name"]
+        meta_text = _contact_meta(edit_row) or "연락처 정보 미입력"
+        signal_html = (
+            "<div class='grid two' style='margin:14px 0;'>"
+            + "<div style='border:1px solid rgba(23,33,43,0.08); border-radius:18px; padding:14px; background:#fff;'>"
+            + "<label>연락처 구분</label>"
+            + f"<div>{_badge(edit_row['contact_type'] or '미분류', 'neutral')} {status_badge(edit_row['status'])}</div>"
+            + f"<div class='muted' style='margin-top:8px'>{esc(summary_text)}</div>"
+            + "</div>"
+            + "<div style='border:1px solid rgba(23,33,43,0.08); border-radius:18px; padding:14px; background:#fff;'>"
+            + "<label>기본 연락수단</label>"
+            + f"<div>{_badge(meta_text if meta_text != '연락처 정보 미입력' else '미입력', 'good' if meta_text != '연락처 정보 미입력' else 'warn')}</div>"
+            + f"<div class='muted' style='margin-top:8px'>{esc(edit_row['address'] or '주소 정보 없음')}</div>"
+            + "</div></div>"
+        )
+    else:
+        signal_html = ""
+
+    related_html = ""
+    if edit_row:
+        if linked_records:
+            related_rows = "".join(
+                """
+                <tr>
+                  <td>{code}</td>
+                  <td><strong>{title}</strong><div class='muted'>{record_type}</div></td>
+                  <td>{status}</td>
+                  <td>{due}</td>
+                  <td><a class='btn secondary' href='/office-records?edit={record_id}'>열기</a></td>
+                </tr>
+                """.format(
+                    code=esc(row["record_code"]),
+                    title=esc(row["title"]),
+                    record_type=esc(row["record_type"] or "-"),
+                    status=status_badge(row["status"]),
+                    due=esc(fmt_date(row["due_date"])),
+                    record_id=row["id"],
+                )
+                for row in linked_records
+            )
+            related_html = (
+                "<section class='panel' style='margin-top:16px;'><h2>연계 행정업무</h2><p class='muted'>이 연락처와 연결된 최근 행정업무입니다.</p>"
+                "<table><thead><tr><th>번호</th><th>업무</th><th>상태</th><th>기한</th><th>열기</th></tr></thead>"
+                f"<tbody>{related_rows}</tbody></table></section>"
+            )
+        else:
+            related_html = "<section class='panel' style='margin-top:16px;'><h2>연계 행정업무</h2>" + empty_state("이 연락처와 연결된 행정업무가 없습니다.") + "</section>"
+
+    form_html = ""
+    if can_create or edit_row:
+        if edit_row and not can_manage_edit_row:
+            form_html = (
+                "<section class='panel'><h2>연락처 상세</h2><p class='muted'>현재 계정은 이 연락처를 조회만 할 수 있습니다.</p>"
+                + signal_html
+                + "<div class='stack'>"
+                + info_box("연락처명", esc(_contact_summary(edit_row) or "-"))
+                + info_box("연락수단", esc(_contact_meta(edit_row) or "-"))
+                + info_box("주소", esc(edit_row["address"] or "-"))
+                + info_box("비고", esc(edit_row["note"] or "-"))
+                + "</div></section>"
+                + related_html
+            )
+        else:
+            form_html = (
+                "<section class='panel'><h2>연락처 등록 / 수정</h2><p class='muted'>업체연락처, 근무자연락처, 계약업체, 관공서를 구분해 저장하고 행정업무와 연결할 수 있습니다.</p>"
+                + signal_html
+                + "<form action='/contacts/save' method='post' class='stack'>"
+                + f"<input type='hidden' name='contact_id' value='{esc(edit_row['id'] if edit_row else '')}'>"
+                + (
+                    f"<div><label>연락처 코드</label><input value='{esc(edit_row['contact_code'])}' disabled></div>"
+                    if edit_row
+                    else ""
+                )
+                + f"<div><label>연락처 구분</label><select name='contact_type'>{render_options(CONTACT_TYPE_OPTIONS, edit_row['contact_type'] if edit_row else '', blank_label='선택')}</select></div>"
+                + "<div class='grid two'>"
+                + f"<div><label>이름 / 담당자</label><input name='name' value='{esc(edit_row['name'] if edit_row else '')}' required></div>"
+                + f"<div><label>업체 / 기관명</label><input name='organization' value='{esc(edit_row['organization'] if edit_row else '')}' placeholder='예: 한국전기안전공사'></div>"
+                + "</div>"
+                + "<div class='grid two'>"
+                + f"<div><label>부서</label><input name='department' value='{esc(edit_row['department'] if edit_row else '')}'></div>"
+                + f"<div><label>직책</label><input name='position' value='{esc(edit_row['position'] if edit_row else '')}'></div>"
+                + "</div>"
+                + "<div class='grid two'>"
+                + f"<div><label>전화번호</label><input name='phone' value='{esc(edit_row['phone'] if edit_row else '')}' inputmode='tel' placeholder='예: 02-1234-5678 / 010-1234-5678'></div>"
+                + f"<div><label>이메일</label><input name='email' type='email' value='{esc(edit_row['email'] if edit_row else '')}' placeholder='name@example.com'></div>"
+                + "</div>"
+                + "<div class='grid two'>"
+                + f"<div><label>상태</label><select name='status'>{render_options(CONTACT_STATUS_OPTIONS, edit_row['status'] if edit_row else '활성')}</select></div>"
+                + "<div><label>&nbsp;</label><a class='btn secondary' href='/office-records'>행정업무 연결 보기</a></div>"
+                + "</div>"
+                + f"<div><label>주소</label><textarea name='address'>{esc(edit_row['address'] if edit_row else '')}</textarea></div>"
+                + f"<div><label>비고</label><textarea name='note'>{esc(edit_row['note'] if edit_row else '')}</textarea></div>"
+                + "<div class='row-actions'>"
+                + "<button class='btn primary' type='submit'>저장</button>"
+                + "<a class='btn secondary' href='/contacts'>새로 입력</a>"
+                + (
+                    _post_action_button(f"/contacts/delete/{edit_row['id']}", "삭제", "이 연락처를 삭제하시겠습니까?")
+                    if edit_row and can_delete_edit_row
+                    else ""
+                )
+                + "</div></form></section>"
+                + related_html
+            )
+    else:
+        form_html = info_box("읽기 전용", "현재 계정은 연락처 조회만 가능합니다. 등록과 수정은 작업자 이상 권한이 필요합니다.")
+
+    if rows:
+        rows_html = []
+        for row in rows:
+            row_actions = []
+            if _can_manage_contact(user, row):
+                row_actions.append(f"<a class='btn secondary' href='/contacts?edit={row['id']}'>상세/수정</a>")
+            else:
+                row_actions.append(f"<a class='btn secondary' href='/contacts?edit={row['id']}'>조회</a>")
+            rows_html.append(
+                """
+                <tr>
+                  <td>{code}</td>
+                  <td><strong>{summary}</strong><div class='muted'>{contact_type}</div><div class='muted'>{organization}</div></td>
+                  <td>{meta}<div class='muted'>{address}</div></td>
+                  <td>{status}</td>
+                  <td>{linked}</td>
+                  <td>{actions}</td>
+                </tr>
+                """.format(
+                    code=esc(row["contact_code"]),
+                    summary=esc(_contact_summary(row) or row["name"]),
+                    contact_type=esc(row["contact_type"] or "-"),
+                    organization=esc(row["organization"] or row["department"] or "-"),
+                    meta=esc(_contact_meta(row) or "-"),
+                    address=esc((row["address"] or "")[:50] + ("..." if len(row["address"] or "") > 50 else "") or "-"),
+                    status=status_badge(row["status"]),
+                    linked=esc(f"{int(row['office_record_count'] or 0)}건"),
+                    actions="".join(row_actions),
+                )
+            )
+        list_html = (
+            "<section class='panel'><div class='split'><div><h2>연락처 목록</h2><p class='muted'>행정업무와 연결할 수 있는 대외 / 내부 연락처를 유형별로 관리합니다.</p></div>"
+            "<form class='inline-form' method='get' action='/contacts'>"
+            f"<input name='q' value='{esc(q)}' placeholder='코드, 이름, 업체, 전화번호 검색'>"
+            f"<select name='contact_type'>{render_options(CONTACT_TYPE_OPTIONS, contact_type, blank_label='전체 구분')}</select>"
+            f"<select name='status'>{render_options(CONTACT_STATUS_OPTIONS, status, blank_label='전체 상태')}</select>"
+            "<button class='btn secondary' type='submit'>검색</button>"
+            "</form></div>"
+            "<table><thead><tr><th>코드</th><th>연락처</th><th>연락수단</th><th>상태</th><th>연계 행정업무</th><th>관리</th></tr></thead>"
+            f"<tbody>{''.join(rows_html)}</tbody></table></section>"
+        )
+    else:
+        list_html = "<section class='panel'><h2>연락처 목록</h2>" + empty_state("조건에 맞는 연락처가 없습니다.") + "</section>"
+
+    flash_message, flash_level = _flash_from_request(request)
+    body = (
+        page_header(
+            "Contacts",
+            "연락처 관리",
+            "업체연락처, 근무자연락처, 계약업체, 관공서를 분리해 저장하고 행정업무와 연결합니다.",
+            actions="<a class='btn secondary' href='/office-records'>행정업무 열기</a>",
+        )
+        + "<div class='layout-2'>"
+        + form_html
+        + list_html
+        + "</div>"
+    )
+    return HTMLResponse(layout(title="연락처 관리", body=body, user=user, flash_message=flash_message, flash_level=flash_level))
+
+
+@app.post("/contacts/save")
+def contacts_save(
+    request: Request,
+    contact_id: str = Form(""),
+    contact_type: str = Form(""),
+    name: str = Form(...),
+    organization: str = Form(""),
+    department: str = Form(""),
+    position: str = Form(""),
+    phone: str = Form(""),
+    email: str = Form(""),
+    address: str = Form(""),
+    status: str = Form("활성"),
+    note: str = Form(""),
+):
+    user, error = _authorize(request, "contacts:view")
+    if error:
+        return error
+
+    contact_id_i = _parse_int(contact_id, 0)
+    conn = get_conn()
+    if contact_id_i:
+        existing = conn.execute("SELECT * FROM contacts WHERE id = ?", (contact_id_i,)).fetchone()
+        if not existing:
+            conn.close()
+            return _with_flash("/contacts", "연락처를 찾을 수 없습니다.", "error")
+        if not _can_manage_contact(user, existing):
+            conn.close()
+            return _with_flash(f"/contacts?edit={contact_id_i}", "이 연락처를 수정할 권한이 없습니다.", "error")
+        conn.execute(
+            """
+            UPDATE contacts
+            SET contact_type = ?, name = ?, organization = ?, department = ?, position = ?, phone = ?, email = ?, address = ?,
+                status = ?, note = ?, updated_by = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                contact_type.strip(),
+                name.strip(),
+                organization.strip(),
+                department.strip(),
+                position.strip(),
+                phone.strip(),
+                email.strip(),
+                address.strip(),
+                status.strip(),
+                note.strip(),
+                user["id"],
+                _now_text(),
+                contact_id_i,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return _with_flash(f"/contacts?edit={contact_id_i}", "연락처가 수정되었습니다.", "ok")
+
+    if not auth.has_permission(user["role"], "contacts:create"):
+        conn.close()
+        return _with_flash("/contacts", "연락처를 등록할 권한이 없습니다.", "error")
+
+    cursor = conn.execute(
+        """
+        INSERT INTO contacts(
+            contact_code, contact_type, name, organization, department, position, phone, email, address, status, note,
+            created_by, updated_by, created_at, updated_at
+        )
+        VALUES ('', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            contact_type.strip(),
+            name.strip(),
+            organization.strip(),
+            department.strip(),
+            position.strip(),
+            phone.strip(),
+            email.strip(),
+            address.strip(),
+            status.strip(),
+            note.strip(),
+            user["id"],
+            user["id"],
+            _now_text(),
+            _now_text(),
+        ),
+    )
+    contact_id_i = cursor.lastrowid
+    conn.execute("UPDATE contacts SET contact_code = ? WHERE id = ?", (f"CNT-{contact_id_i:04d}", contact_id_i))
+    conn.commit()
+    conn.close()
+    return _with_flash(f"/contacts?edit={contact_id_i}", "연락처가 등록되었습니다.", "ok")
+
+
+@app.post("/contacts/delete/{contact_id}")
+def contacts_delete(request: Request, contact_id: int):
+    user, error = _authorize(request, "contacts:view")
+    if error:
+        return error
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM contacts WHERE id = ?", (contact_id,)).fetchone()
+    if not row:
+        conn.close()
+        return _with_flash("/contacts", "연락처를 찾을 수 없습니다.", "error")
+    if not _can_delete_contact(user, row):
+        conn.close()
+        return _with_flash(f"/contacts?edit={contact_id}", "이 연락처를 삭제할 권한이 없습니다.", "error")
+    conn.execute(
+        "UPDATE office_records SET contact_id = NULL, updated_by = ?, updated_at = ? WHERE contact_id = ?",
+        (user["id"], _now_text(), contact_id),
+    )
+    conn.execute("DELETE FROM contacts WHERE id = ?", (contact_id,))
+    conn.commit()
+    conn.close()
+    return _with_flash("/contacts", "연락처가 삭제되었습니다.", "ok")
+
+
 @app.get("/office-records", response_class=HTMLResponse)
 def office_records_page(request: Request):
     user, error = _authorize(request, "office_records:view")
@@ -2374,8 +2804,10 @@ def office_records_page(request: Request):
     where = []
     params: list = []
     if q:
-        where.append("(r.record_code LIKE ? OR r.title LIKE ? OR r.target_name LIKE ? OR r.description LIKE ?)")
-        params.extend([f"%{q}%"] * 4)
+        where.append(
+            "(r.record_code LIKE ? OR r.title LIKE ? OR r.target_name LIKE ? OR r.description LIKE ? OR c.name LIKE ? OR c.organization LIKE ? OR c.phone LIKE ?)"
+        )
+        params.extend([f"%{q}%"] * 7)
     if record_type:
         where.append("r.record_type = ?")
         params.append(record_type)
@@ -2389,9 +2821,13 @@ def office_records_page(request: Request):
 
     rows = conn.execute(
         f"""
-        SELECT r.*, f.name AS facility_name, u.full_name AS owner_name
+        SELECT r.*, f.name AS facility_name, u.full_name AS owner_name,
+               c.contact_type AS contact_contact_type, c.name AS contact_name, c.organization AS contact_organization,
+               c.department AS contact_department, c.position AS contact_position, c.phone AS contact_phone,
+               c.email AS contact_email, c.status AS contact_status
         FROM office_records r
         LEFT JOIN facilities f ON f.id = r.facility_id
+        LEFT JOIN contacts c ON c.id = r.contact_id
         LEFT JOIN users u ON u.id = r.owner_user_id
         {where_sql}
         ORDER BY CASE WHEN r.status IN ('완료') THEN 1 ELSE 0 END,
@@ -2404,9 +2840,13 @@ def office_records_page(request: Request):
     edit_row = (
         conn.execute(
             """
-            SELECT r.*, f.name AS facility_name, u.full_name AS owner_name
+            SELECT r.*, f.name AS facility_name, u.full_name AS owner_name,
+                   c.contact_type AS contact_contact_type, c.name AS contact_name, c.organization AS contact_organization,
+                   c.department AS contact_department, c.position AS contact_position, c.phone AS contact_phone,
+                   c.email AS contact_email, c.status AS contact_status
             FROM office_records r
             LEFT JOIN facilities f ON f.id = r.facility_id
+            LEFT JOIN contacts c ON c.id = r.contact_id
             LEFT JOIN users u ON u.id = r.owner_user_id
             WHERE r.id = ?
             """,
@@ -2431,6 +2871,7 @@ def office_records_page(request: Request):
         else []
     )
     facility_options = _facility_options(conn)
+    contact_options = _contact_options(conn)
     owner_options = _user_options(conn, include_viewers=False)
     conn.close()
 
@@ -2441,16 +2882,22 @@ def office_records_page(request: Request):
     signal_html = ""
     if edit_row:
         due_label, due_tone, due_note = _office_record_due_meta(edit_row)
+        contact_summary = _contact_summary(edit_row, prefix="contact_")
+        contact_meta = _contact_meta(edit_row, prefix="contact_")
+        target_label = edit_row["target_name"] or _contact_target_default(edit_row, prefix="contact_") or "대상 / 수신처 미입력"
         signal_html = (
             "<div class='grid two' style='margin:14px 0;'>"
             + "<div style='border:1px solid rgba(23,33,43,0.08); border-radius:18px; padding:14px; background:#fff;'>"
             + "<label>업무 구분</label>"
             + f"<div>{_badge(edit_row['record_type'] or '미분류', 'neutral')} {status_badge(edit_row['status'])}</div>"
-            + f"<div class='muted' style='margin-top:8px'>{esc(edit_row['target_name'] or '대상 / 수신처 미입력')}</div>"
+            + f"<div class='muted' style='margin-top:8px'>{esc(target_label)}</div>"
             + "</div>"
             + "<div style='border:1px solid rgba(23,33,43,0.08); border-radius:18px; padding:14px; background:#fff;'>"
             + "<label>기한 신호</label>"
-            + f"<div>{_badge(due_label, due_tone)}</div><div class='muted' style='margin-top:8px'>{esc(due_note)}</div>"
+            + f"<div>{_badge(due_label, due_tone)}</div><div class='muted' style='margin-top:8px'>{esc(due_note)}"
+            + (f" / 연결 연락처 {esc(contact_summary)}" if contact_summary else "")
+            + (f" / {esc(contact_meta)}" if contact_meta else "")
+            + "</div>"
             + "</div></div>"
         )
 
@@ -2465,7 +2912,9 @@ def office_records_page(request: Request):
                 + "<div class='stack'>"
                 + info_box("관리번호", esc(edit_row["record_code"]))
                 + info_box("제목", esc(edit_row["title"]))
-                + info_box("대상 / 수신처", esc(edit_row["target_name"] or "-"))
+                + info_box("대상 / 수신처", esc(edit_row["target_name"] or _contact_target_default(edit_row, prefix="contact_") or "-"))
+                + info_box("연결 연락처", esc(_contact_summary(edit_row, prefix="contact_") or "-"))
+                + info_box("연락수단", esc(_contact_meta(edit_row, prefix="contact_") or "-"))
                 + info_box("업무 내용", esc(edit_row["description"] or "-"))
                 + "</div>"
             )
@@ -2485,7 +2934,11 @@ def office_records_page(request: Request):
                 + f"<div><label>제목</label><input name='title' value='{esc(edit_row['title'] if edit_row else '')}' required></div>"
                 + "<div class='grid two'>"
                 + f"<div><label>연결 시설</label><select name='facility_id'>{render_options(facility_options, str(edit_row['facility_id'] or '') if edit_row else '', blank_label='미지정')}</select></div>"
-                + f"<div><label>대상 / 수신처</label><input name='target_name' value='{esc(edit_row['target_name'] if edit_row else '')}' placeholder='예: 관리사무소 / 101동 소방설비'></div>"
+                + f"<div><label>연결 연락처</label><select name='contact_id'>{render_options(contact_options, str(edit_row['contact_id'] or '') if edit_row else '', blank_label='미지정')}</select><div class='muted'>선택하면 행정업무 상세에서 연락처 정보를 바로 확인할 수 있습니다.</div></div>"
+                + "</div>"
+                + "<div class='grid two'>"
+                + f"<div><label>대상 / 수신처</label><input name='target_name' value='{esc(edit_row['target_name'] if edit_row else '')}' placeholder='비우면 연결 연락처명으로 자동 입력'></div>"
+                + "<div><label>&nbsp;</label><a class='btn secondary' href='/contacts'>연락처 관리</a></div>"
                 + "</div>"
                 + "<div class='grid two'>"
                 + f"<div><label>우선도</label><select name='priority'>{render_options(OFFICE_RECORD_PRIORITY_OPTIONS, edit_row['priority'] if edit_row else '보통')}</select></div>"
@@ -2564,7 +3017,7 @@ def office_records_page(request: Request):
                 """
                 <tr>
                   <td>{code}</td>
-                  <td><strong>{title}</strong><div class='muted'>{record_type}</div><div class='muted'>{target}</div><div class='muted'>{description}</div></td>
+                  <td><strong>{title}</strong><div class='muted'>{record_type}</div><div class='muted'>{target}</div><div class='muted'>{contact}</div><div class='muted'>{description}</div></td>
                   <td>{facility}</td>
                   <td>{priority}<div style='margin-top:6px'>{status}</div></td>
                   <td>{owner}<div class='muted'>기한 {due}</div><div style='margin-top:6px'>{due_badge}</div></td>
@@ -2575,7 +3028,8 @@ def office_records_page(request: Request):
                     code=esc(row["record_code"]),
                     title=esc(row["title"]),
                     record_type=esc(row["record_type"] or "-"),
-                    target=esc(row["target_name"] or "대상 / 수신처 미입력"),
+                    target=esc(row["target_name"] or _contact_target_default(row, prefix="contact_") or "대상 / 수신처 미입력"),
+                    contact=esc(_contact_summary(row, prefix="contact_") or "-"),
                     description=esc((row["description"] or "")[:80] + ("..." if len(row["description"] or "") > 80 else "")),
                     facility=esc(row["facility_name"] or "시설 미지정"),
                     priority=status_badge(row["priority"]),
@@ -2624,6 +3078,7 @@ def office_records_save(
     record_type: str = Form(""),
     title: str = Form(...),
     facility_id: str = Form(""),
+    contact_id: str = Form(""),
     target_name: str = Form(""),
     priority: str = Form("보통"),
     status: str = Form("작성전"),
@@ -2638,10 +3093,12 @@ def office_records_save(
 
     record_id_i = _parse_int(record_id, 0)
     facility_id_i = _parse_int(facility_id, 0) or None
+    contact_id_i = _parse_int(contact_id, 0) or None
     owner_id_i = _parse_int(owner_user_id, 0) or None
     completed_at = _office_record_completed_at(status)
 
     conn = get_conn()
+    target_name_text = _office_record_target_name(conn, contact_id_i, target_name)
     if record_id_i:
         existing = conn.execute("SELECT * FROM office_records WHERE id = ?", (record_id_i,)).fetchone()
         if not existing:
@@ -2654,7 +3111,7 @@ def office_records_save(
         conn.execute(
             """
             UPDATE office_records
-            SET record_type = ?, title = ?, facility_id = ?, target_name = ?, priority = ?, status = ?, description = ?,
+            SET record_type = ?, title = ?, facility_id = ?, contact_id = ?, target_name = ?, priority = ?, status = ?, description = ?,
                 owner_user_id = ?, due_date = ?, completed_at = ?, updated_by = ?, updated_at = ?
             WHERE id = ?
             """,
@@ -2662,7 +3119,8 @@ def office_records_save(
                 record_type.strip(),
                 title.strip(),
                 facility_id_i,
-                target_name.strip(),
+                contact_id_i,
+                target_name_text,
                 priority.strip(),
                 status.strip(),
                 description.strip(),
@@ -2693,16 +3151,17 @@ def office_records_save(
     cursor = conn.execute(
         """
         INSERT INTO office_records(
-            record_code, record_type, title, facility_id, target_name, priority, status, description,
+            record_code, record_type, title, facility_id, contact_id, target_name, priority, status, description,
             owner_user_id, due_date, completed_at, created_by, updated_by, created_at, updated_at
         )
-        VALUES ('', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES ('', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             record_type.strip(),
             title.strip(),
             facility_id_i,
-            target_name.strip(),
+            contact_id_i,
+            target_name_text,
             priority.strip(),
             status.strip(),
             description.strip(),

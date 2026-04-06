@@ -93,6 +93,58 @@ def main() -> None:
         facility_row = fetchone("SELECT * FROM facilities WHERE id = ?", (facility_id,))
         expect(facility_row["name"].endswith("-수정"), "시설 수정이 반영되지 않았습니다.")
 
+        contact_name = f"검증연락처-{suffix}"
+        contact_create = client.post(
+            "/contacts/save",
+            data={
+                "contact_type": "계약업체",
+                "name": contact_name,
+                "organization": "검증설비주식회사",
+                "department": "유지보수팀",
+                "position": "대리",
+                "phone": "02-1234-5678",
+                "email": "contact@example.com",
+                "address": "서울시 테스트구 점검로 1",
+                "status": "활성",
+                "note": "연락처 생성 검증",
+            },
+            follow_redirects=False,
+        )
+        expect(contact_create.status_code in {302, 303}, "연락처 등록 요청이 실패했습니다.")
+        contact_row = fetchone("SELECT * FROM contacts WHERE name = ?", (contact_name,))
+        expect(contact_row is not None, "연락처가 생성되지 않았습니다.")
+        contact_id = contact_row["id"]
+
+        contact_page = client.get(f"/contacts?edit={contact_id}")
+        expect(
+            contact_page.status_code == 200 and f"formaction='/contacts/delete/{contact_id}'" in contact_page.text,
+            "연락처 수정 화면의 삭제 버튼 구조가 올바르지 않습니다.",
+        )
+
+        contact_update = client.post(
+            "/contacts/save",
+            data={
+                "contact_id": str(contact_id),
+                "contact_type": "관공서",
+                "name": f"{contact_name}-수정",
+                "organization": "테스트구청",
+                "department": "시설관리과",
+                "position": "주무관",
+                "phone": "02-9876-5432",
+                "email": "gov@example.com",
+                "address": "서울시 테스트구 청사로 10",
+                "status": "활성",
+                "note": "연락처 수정 검증",
+            },
+            follow_redirects=False,
+        )
+        expect(contact_update.status_code in {302, 303}, "연락처 수정 요청이 실패했습니다.")
+        contact_row = fetchone("SELECT * FROM contacts WHERE id = ?", (contact_id,))
+        expect(
+            contact_row["name"].endswith("-수정") and contact_row["contact_type"] == "관공서" and contact_row["organization"] == "테스트구청",
+            "연락처 수정이 반영되지 않았습니다.",
+        )
+
         office_title = f"검증행정업무-{suffix}"
         office_create = client.post(
             "/office-records/save",
@@ -100,7 +152,8 @@ def main() -> None:
                 "record_type": "정기점검",
                 "title": office_title,
                 "facility_id": str(facility_id),
-                "target_name": "101동 소방설비",
+                "contact_id": str(contact_id),
+                "target_name": "",
                 "priority": "높음",
                 "status": "작성중",
                 "description": "행정업무 생성 검증",
@@ -112,11 +165,15 @@ def main() -> None:
         expect(office_create.status_code in {302, 303}, "행정업무 등록 요청이 실패했습니다.")
         office_row = fetchone("SELECT * FROM office_records WHERE title = ?", (office_title,))
         expect(office_row is not None, "행정업무가 생성되지 않았습니다.")
+        expect(office_row["contact_id"] == contact_id, "행정업무에 연락처 연결이 저장되지 않았습니다.")
+        expect("테스트구청" in str(office_row["target_name"]), "행정업무 대상명이 연결 연락처 기준으로 자동 입력되지 않았습니다.")
         office_id = office_row["id"]
 
         office_page = client.get(f"/office-records?edit={office_id}")
         expect(
-            office_page.status_code == 200 and f"formaction='/office-records/delete/{office_id}'" in office_page.text,
+            office_page.status_code == 200
+            and f"formaction='/office-records/delete/{office_id}'" in office_page.text
+            and "gov@example.com" in office_page.text,
             "행정업무 수정 화면의 삭제 버튼 구조가 올바르지 않습니다.",
         )
 
@@ -127,6 +184,7 @@ def main() -> None:
                 "record_type": "공문서",
                 "title": f"{office_title}-수정",
                 "facility_id": str(facility_id),
+                "contact_id": str(contact_id),
                 "target_name": "구청 시설관리팀",
                 "priority": "긴급",
                 "status": "결재대기",
@@ -139,7 +197,10 @@ def main() -> None:
         expect(office_update.status_code in {302, 303}, "행정업무 수정 요청이 실패했습니다.")
         office_row = fetchone("SELECT * FROM office_records WHERE id = ?", (office_id,))
         expect(
-            office_row["title"].endswith("-수정") and office_row["record_type"] == "공문서" and office_row["priority"] == "긴급",
+            office_row["title"].endswith("-수정")
+            and office_row["record_type"] == "공문서"
+            and office_row["priority"] == "긴급"
+            and office_row["contact_id"] == contact_id,
             "행정업무 수정이 반영되지 않았습니다.",
         )
 
@@ -153,6 +214,12 @@ def main() -> None:
         expect(office_row["status"] == "완료" and office_row["completed_at"], "행정업무 상태 업데이트가 반영되지 않았습니다.")
         office_update_count = fetchone("SELECT COUNT(*) AS count FROM office_record_updates WHERE office_record_id = ?", (office_id,))["count"]
         expect(office_update_count >= 3, "행정업무 이력이 충분히 생성되지 않았습니다.")
+
+        contact_detail = client.get(f"/contacts?edit={contact_id}")
+        expect(
+            contact_detail.status_code == 200 and office_title in contact_detail.text,
+            "연락처 상세 화면에 연계 행정업무가 표시되지 않습니다.",
+        )
 
         complaint_title = f"검증민원-{suffix}"
         complaint_create = client.post(
@@ -512,6 +579,12 @@ def main() -> None:
         work_delete = client.post(f"/work-orders/delete/{work_id}", follow_redirects=False)
         expect(work_delete.status_code in {302, 303}, "작업지시 삭제 요청이 실패했습니다.")
         expect(fetchone("SELECT * FROM work_orders WHERE id = ?", (work_id,)) is None, "작업지시가 삭제되지 않았습니다.")
+
+        contact_delete = client.post(f"/contacts/delete/{contact_id}", follow_redirects=False)
+        expect(contact_delete.status_code in {302, 303}, "연락처 삭제 요청이 실패했습니다.")
+        expect(fetchone("SELECT * FROM contacts WHERE id = ?", (contact_id,)) is None, "연락처가 삭제되지 않았습니다.")
+        office_row = fetchone("SELECT * FROM office_records WHERE id = ?", (office_id,))
+        expect(office_row is not None and office_row["contact_id"] is None, "연락처 삭제 시 행정업무 연결 해제가 반영되지 않았습니다.")
 
         office_delete = client.post(f"/office-records/delete/{office_id}", follow_redirects=False)
         expect(office_delete.status_code in {302, 303}, "행정업무 삭제 요청이 실패했습니다.")
