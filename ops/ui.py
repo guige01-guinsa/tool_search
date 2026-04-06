@@ -110,6 +110,45 @@ def attachment_gallery(attachments, *, prefer_links: bool = False) -> str:
     return "<div class='attachment-stack'>" + "".join(blocks) + "</div>"
 
 
+def attachment_selector(attachments, *, field_name: str = "attachment_ids", prefer_links: bool = False) -> str:
+    if not attachments:
+        return "<div class='muted'>첨부 없음</div>"
+    items = []
+    for row in attachments:
+        file_path = row["file_path"]
+        href = f"/uploads/{quote(file_path)}"
+        original_name = row["original_name"] or file_path
+        extension = Path(str(original_name)).suffix.lower()
+        if not prefer_links and extension in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}:
+            preview = (
+                "<a class='thumb-link' target='_blank' href='"
+                + href
+                + "'><img class='thumb' src='"
+                + href
+                + "' alt='attachment'></a>"
+            )
+        else:
+            preview = (
+                "<a class='file-chip' target='_blank' href='"
+                + href
+                + "'>"
+                + esc(original_name)
+                + "</a>"
+            )
+        items.append(
+            "<label class='attachment-select-item'>"
+            + "<span class='attachment-select-head'>"
+            + f"<input type='checkbox' name='{esc(field_name)}' value='{esc(row['id'])}' style='width:auto;'>"
+            + "<span>선택</span>"
+            + "</span>"
+            + preview
+            + "<span class='attachment-select-name'>"
+            + esc(original_name)
+            + "</span></label>"
+        )
+    return "<div class='attachment-select-grid'>" + "".join(items) + "</div>"
+
+
 def page_header(eyebrow: str, title: str, description: str, actions: str = "") -> str:
     action_block = f"<div class='page-actions'>{actions}</div>" if actions else ""
     return (
@@ -518,6 +557,35 @@ def layout(
       color: var(--brand);
       font-size: 12px;
       font-weight: 700;
+    }}
+    .attachment-select-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+      gap: 10px;
+      margin-top: 8px;
+    }}
+    .attachment-select-item {{
+      display: grid;
+      gap: 8px;
+      padding: 10px;
+      border-radius: 16px;
+      border: 1px solid rgba(23, 33, 43, 0.1);
+      background: rgba(247, 245, 239, 0.9);
+      cursor: pointer;
+    }}
+    .attachment-select-head {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--ink);
+    }}
+    .attachment-select-name {{
+      font-size: 11px;
+      color: var(--muted);
+      word-break: break-all;
+      line-height: 1.4;
     }}
     .stack {{
       display: grid;

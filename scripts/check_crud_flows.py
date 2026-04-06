@@ -61,6 +61,12 @@ def main() -> None:
             conn.close()
             return row
 
+        def fetchall(query: str, params: tuple = ()):
+            conn = get_conn()
+            rows = conn.execute(query, params).fetchall()
+            conn.close()
+            return rows
+
         suffix = uuid.uuid4().hex[:8]
 
         facility_name = f"검증시설-{suffix}"
@@ -90,7 +96,12 @@ def main() -> None:
         expect(facility_attachment_count == 6, "시설 첨부 이미지 저장 개수가 올바르지 않습니다.")
 
         facility_page = client.get(f"/facilities?edit={facility_id}")
-        expect(facility_page.status_code == 200 and "formaction='/facilities/delete/" in facility_page.text, "시설 수정 화면의 삭제 버튼 구조가 올바르지 않습니다.")
+        expect(
+            facility_page.status_code == 200
+            and "formaction='/facilities/delete/" in facility_page.text
+            and "선택 첨부 삭제" in facility_page.text,
+            "시설 수정 화면의 삭제 버튼 구조가 올바르지 않습니다.",
+        )
 
         facility_update = client.post(
             "/facilities/save",
@@ -135,6 +146,46 @@ def main() -> None:
             (facility_id,),
         )["count"]
         expect(facility_attachment_count == 6, "시설 첨부 초과 시 이미지가 추가 저장되면 안 됩니다.")
+        facility_attachment_ids = [
+            row["id"]
+            for row in fetchall(
+                "SELECT id FROM attachments WHERE entity_type = 'facility' AND entity_id = ? ORDER BY id ASC LIMIT 2",
+                (facility_id,),
+            )
+        ]
+        facility_delete_selected = client.post(
+            f"/facilities/attachments/delete/{facility_id}",
+            data={"attachment_ids": [str(attachment_id) for attachment_id in facility_attachment_ids]},
+            follow_redirects=False,
+        )
+        expect(facility_delete_selected.status_code in {302, 303}, "시설 선택 첨부 삭제 요청이 실패했습니다.")
+        facility_attachment_count = fetchone(
+            "SELECT COUNT(*) AS count FROM attachments WHERE entity_type = 'facility' AND entity_id = ?",
+            (facility_id,),
+        )["count"]
+        expect(facility_attachment_count == 4, "시설 선택 첨부 삭제가 반영되지 않았습니다.")
+        facility_refill = client.post(
+            "/facilities/save",
+            data={
+                "facility_id": str(facility_id),
+                "category": "기계",
+                "name": f"{facility_name}-수정",
+                "building": "별관",
+                "floor": "1F",
+                "zone": "기계실",
+                "status": "점검중",
+                "manager_user_id": "",
+                "note": "삭제 후 재업로드",
+            },
+            files=image_files(f"facility-refill-{suffix}", 2),
+            follow_redirects=False,
+        )
+        expect(facility_refill.status_code in {302, 303}, "시설 첨부 재업로드 요청이 실패했습니다.")
+        facility_attachment_count = fetchone(
+            "SELECT COUNT(*) AS count FROM attachments WHERE entity_type = 'facility' AND entity_id = ?",
+            (facility_id,),
+        )["count"]
+        expect(facility_attachment_count == 6, "시설 첨부 삭제 후 재업로드가 반영되지 않았습니다.")
 
         contact_name = f"검증연락처-{suffix}"
         contact_create = client.post(
@@ -393,7 +444,12 @@ def main() -> None:
         expect(inventory_attachment_count == 6, "재고 첨부 이미지 저장 개수가 올바르지 않습니다.")
 
         inventory_page = client.get(f"/inventory?edit={inventory_id}")
-        expect(inventory_page.status_code == 200 and "formaction='/inventory/delete/" in inventory_page.text, "재고 수정 화면의 삭제 버튼 구조가 올바르지 않습니다.")
+        expect(
+            inventory_page.status_code == 200
+            and "formaction='/inventory/delete/" in inventory_page.text
+            and "선택 첨부 삭제" in inventory_page.text,
+            "재고 수정 화면의 삭제 버튼 구조가 올바르지 않습니다.",
+        )
 
         inventory_update = client.post(
             "/inventory/save",
@@ -444,6 +500,49 @@ def main() -> None:
             (inventory_id,),
         )["count"]
         expect(inventory_attachment_count == 6, "재고 첨부 초과 시 이미지가 추가 저장되면 안 됩니다.")
+        inventory_attachment_ids = [
+            row["id"]
+            for row in fetchall(
+                "SELECT id FROM attachments WHERE entity_type = 'inventory' AND entity_id = ? ORDER BY id ASC LIMIT 2",
+                (inventory_id,),
+            )
+        ]
+        inventory_delete_selected = client.post(
+            f"/inventory/attachments/delete/{inventory_id}",
+            data={"attachment_ids": [str(attachment_id) for attachment_id in inventory_attachment_ids]},
+            follow_redirects=False,
+        )
+        expect(inventory_delete_selected.status_code in {302, 303}, "재고 선택 첨부 삭제 요청이 실패했습니다.")
+        inventory_attachment_count = fetchone(
+            "SELECT COUNT(*) AS count FROM attachments WHERE entity_type = 'inventory' AND entity_id = ?",
+            (inventory_id,),
+        )["count"]
+        expect(inventory_attachment_count == 4, "재고 선택 첨부 삭제가 반영되지 않았습니다.")
+        inventory_refill = client.post(
+            "/inventory/save",
+            data={
+                "item_id": str(inventory_id),
+                "category": "기계",
+                "name": f"{inventory_name}-수정",
+                "specification": "20A",
+                "quantity": "8",
+                "unit": "개",
+                "location": "창고 B",
+                "status": "정상",
+                "min_quantity": "3",
+                "purchase_date": "2026-03-30",
+                "purchase_amount": "12000",
+                "note": "삭제 후 재업로드",
+            },
+            files=image_files(f"inventory-refill-{suffix}", 2),
+            follow_redirects=False,
+        )
+        expect(inventory_refill.status_code in {302, 303}, "재고 첨부 재업로드 요청이 실패했습니다.")
+        inventory_attachment_count = fetchone(
+            "SELECT COUNT(*) AS count FROM attachments WHERE entity_type = 'inventory' AND entity_id = ?",
+            (inventory_id,),
+        )["count"]
+        expect(inventory_attachment_count == 6, "재고 첨부 삭제 후 재업로드가 반영되지 않았습니다.")
 
         inventory_tx = client.post(
             f"/inventory/tx/{inventory_id}",

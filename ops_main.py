@@ -19,6 +19,7 @@ from ops import auth, db as ops_db, pdf_import
 from ops.db import get_conn, init_db, migrate_legacy_tools
 from ops.ui import (
     attachment_gallery,
+    attachment_selector,
     empty_state,
     esc,
     fmt_date,
@@ -445,6 +446,53 @@ def _attachment_limit_error(conn, entity_type: str, entity_id: int | None, files
         remaining = max(limit - existing_count, 0)
         return f"첨부 이미지는 최대 {limit}장까지 저장됩니다. 현재 {existing_count}장이 있어 {remaining}장만 추가할 수 있습니다."
     return f"첨부 이미지는 최대 {limit}장까지 저장됩니다."
+
+
+def _parse_id_list(values: Iterable[str]) -> list[int]:
+    result: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        parsed = _parse_int(value, 0)
+        if parsed > 0 and parsed not in seen:
+            seen.add(parsed)
+            result.append(parsed)
+    return result
+
+
+def _attachment_rows_for_ids(conn, entity_type: str, entity_id: int, attachment_ids: list[int]) -> list:
+    if not attachment_ids:
+        return []
+    placeholders = ",".join(["?"] * len(attachment_ids))
+    return conn.execute(
+        f"""
+        SELECT id, file_path
+        FROM attachments
+        WHERE entity_type = ?
+          AND entity_id = ?
+          AND id IN ({placeholders})
+        """,
+        [entity_type, entity_id, *attachment_ids],
+    ).fetchall()
+
+
+def _delete_selected_attachments(conn, entity_type: str, entity_id: int, attachment_ids: list[int]) -> int:
+    rows = _attachment_rows_for_ids(conn, entity_type, entity_id, attachment_ids)
+    if not rows:
+        return 0
+    delete_ids = [row["id"] for row in rows]
+    placeholders = ",".join(["?"] * len(delete_ids))
+    conn.execute(
+        f"DELETE FROM attachments WHERE id IN ({placeholders})",
+        delete_ids,
+    )
+    for row in rows:
+        file_path = UPLOAD_DIR / row["file_path"]
+        try:
+            if file_path.exists():
+                file_path.unlink()
+        except Exception:
+            continue
+    return len(delete_ids)
 
 
 def _save_attachments(conn, entity_type: str, entity_id: int, files: Iterable[UploadFile], user_id: int | None) -> None:
@@ -2373,7 +2421,19 @@ def facilities_page(request: Request):
             + "</div></form>"
         )
         if edit_row:
-            form_html += "<div style='margin-top:14px'><label>현재 첨부</label>" + attachment_gallery(attachments.get(edit_row["id"], [])) + "</div>"
+            current_attachments = attachments.get(edit_row["id"], [])
+            form_html += "<div style='margin-top:14px'><label>현재 첨부</label>"
+            form_html += attachment_gallery(current_attachments)
+            if current_attachments:
+                form_html += (
+                    f"<form action='/facilities/attachments/delete/{edit_row['id']}' method='post' class='stack' style='margin-top:10px;'>"
+                    + "<p class='muted'>삭제할 첨부를 선택하면 한 번에 정리할 수 있습니다.</p>"
+                    + attachment_selector(current_attachments)
+                    + "<div class='row-actions'>"
+                    + "<button class='btn warn' type='submit' onclick=\"return confirm('선택한 첨부를 삭제하시겠습니까?')\">선택 첨부 삭제</button>"
+                    + "</div></form>"
+                )
+            form_html += "</div>"
         form_html += "</section>"
     else:
         form_html = info_box("읽기 전용", "현재 계정은 시설 조회 권한만 있습니다. 수정은 운영관리 이상 역할이 필요합니다.")
@@ -2432,6 +2492,33 @@ def facilities_page(request: Request):
         + "</div>"
     )
     return HTMLResponse(layout(title="시설 관리", body=body, user=user, flash_message=flash_message, flash_level=flash_level))
+
+
+@app.post("/facilities/attachments/delete/{facility_id}")
+def facilities_delete_attachments(
+    request: Request,
+    facility_id: int,
+    attachment_ids: List[str] = Form(default=[]),
+):
+    user, error = _authorize(request, "facilities:edit")
+    if error:
+        return error
+
+    attachment_ids_i = _parse_id_list(attachment_ids)
+    if not attachment_ids_i:
+        return _with_flash(f"/facilities?edit={facility_id}", "삭제할 첨부를 선택해 주세요.", "error")
+
+    conn = get_conn()
+    facility = conn.execute("SELECT id FROM facilities WHERE id = ?", (facility_id,)).fetchone()
+    if not facility:
+        conn.close()
+        return _with_flash("/facilities", "시설을 찾을 수 없습니다.", "error")
+    deleted_count = _delete_selected_attachments(conn, "facility", facility_id, attachment_ids_i)
+    conn.commit()
+    conn.close()
+    if not deleted_count:
+        return _with_flash(f"/facilities?edit={facility_id}", "삭제할 첨부를 찾을 수 없습니다.", "error")
+    return _with_flash(f"/facilities?edit={facility_id}", f"선택한 첨부 {deleted_count}건이 삭제되었습니다.", "ok")
 
 
 @app.post("/facilities/save")
@@ -3446,7 +3533,19 @@ def inventory_page(request: Request):
             + "</div></form>"
         )
         if edit_row:
-            form_html += "<div style='margin-top:14px'><label>현재 첨부</label>" + attachment_gallery(attachments.get(edit_row["id"], [])) + "</div>"
+            current_attachments = attachments.get(edit_row["id"], [])
+            form_html += "<div style='margin-top:14px'><label>현재 첨부</label>"
+            form_html += attachment_gallery(current_attachments)
+            if current_attachments:
+                form_html += (
+                    f"<form action='/inventory/attachments/delete/{edit_row['id']}' method='post' class='stack' style='margin-top:10px;'>"
+                    + "<p class='muted'>삭제할 첨부를 선택하면 한 번에 정리할 수 있습니다.</p>"
+                    + attachment_selector(current_attachments)
+                    + "<div class='row-actions'>"
+                    + "<button class='btn warn' type='submit' onclick=\"return confirm('선택한 첨부를 삭제하시겠습니까?')\">선택 첨부 삭제</button>"
+                    + "</div></form>"
+                )
+            form_html += "</div>"
         if edit_row and can_tx:
             tx_history = (
                 "".join(
@@ -3552,6 +3651,33 @@ def inventory_page(request: Request):
         + "</div>"
     )
     return HTMLResponse(layout(title="재고 관리", body=body, user=user, flash_message=flash_message, flash_level=flash_level))
+
+
+@app.post("/inventory/attachments/delete/{item_id}")
+def inventory_delete_attachments(
+    request: Request,
+    item_id: int,
+    attachment_ids: List[str] = Form(default=[]),
+):
+    user, error = _authorize(request, "inventory:edit")
+    if error:
+        return error
+
+    attachment_ids_i = _parse_id_list(attachment_ids)
+    if not attachment_ids_i:
+        return _with_flash(f"/inventory?edit={item_id}", "삭제할 첨부를 선택해 주세요.", "error")
+
+    conn = get_conn()
+    item = conn.execute("SELECT id FROM inventory_items WHERE id = ?", (item_id,)).fetchone()
+    if not item:
+        conn.close()
+        return _with_flash("/inventory", "재고 품목을 찾을 수 없습니다.", "error")
+    deleted_count = _delete_selected_attachments(conn, "inventory", item_id, attachment_ids_i)
+    conn.commit()
+    conn.close()
+    if not deleted_count:
+        return _with_flash(f"/inventory?edit={item_id}", "삭제할 첨부를 찾을 수 없습니다.", "error")
+    return _with_flash(f"/inventory?edit={item_id}", f"선택한 첨부 {deleted_count}건이 삭제되었습니다.", "ok")
 
 
 @app.post("/inventory/save")
