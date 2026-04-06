@@ -1972,6 +1972,13 @@ def dashboard(request: Request):
         """,
         (_today_text(),),
     ).fetchone()["count"]
+    total_contacts = conn.execute("SELECT COUNT(*) AS count FROM contacts").fetchone()["count"]
+    active_contacts = conn.execute(
+        "SELECT COUNT(*) AS count FROM contacts WHERE status = '활성'"
+    ).fetchone()["count"]
+    linked_contacts = conn.execute(
+        "SELECT COUNT(DISTINCT contact_id) AS count FROM office_records WHERE contact_id IS NOT NULL"
+    ).fetchone()["count"]
     active_users = conn.execute(
         "SELECT COUNT(*) AS count FROM users WHERE is_active = 1"
     ).fetchone()["count"]
@@ -2020,11 +2027,25 @@ def dashboard(request: Request):
     ).fetchall()
     recent_office_records = conn.execute(
         """
-        SELECT r.*, f.name AS facility_name, u.full_name AS owner_name
+        SELECT r.*, f.name AS facility_name, u.full_name AS owner_name,
+               c.contact_type AS contact_contact_type, c.name AS contact_name, c.organization AS contact_organization,
+               c.department AS contact_department, c.position AS contact_position, c.phone AS contact_phone,
+               c.email AS contact_email, c.status AS contact_status
         FROM office_records r
         LEFT JOIN facilities f ON f.id = r.facility_id
+        LEFT JOIN contacts c ON c.id = r.contact_id
         LEFT JOIN users u ON u.id = r.owner_user_id
         ORDER BY r.updated_at DESC, r.id DESC
+        LIMIT 8
+        """
+    ).fetchall()
+    recent_contacts = conn.execute(
+        """
+        SELECT c.*, COUNT(DISTINCT r.id) AS office_record_count
+        FROM contacts c
+        LEFT JOIN office_records r ON r.contact_id = c.id
+        GROUP BY c.id
+        ORDER BY c.updated_at DESC, c.id DESC
         LIMIT 8
         """
     ).fetchall()
@@ -2049,6 +2070,7 @@ def dashboard(request: Request):
         + metric_card("반복 민원", repeat_open_complaints, f"최근 {COMPLAINT_REPEAT_WINDOW_DAYS}일 기준")
         + metric_card("미완료 작업", open_work, f"지연 {overdue_work}건")
         + metric_card("행정업무", open_office_records, f"기한 초과 {overdue_office_records}건")
+        + metric_card("연락처", total_contacts, f"활성 {active_contacts}건 / 연계 {linked_contacts}건")
         + metric_card("활성 사용자", active_users, f"오늘 완료 {today_completed}건")
         + metric_card("오늘 접수", today_received, f"SLA 오늘 마감 {due_today_complaints}건")
         + metric_card("만족도", feedback_stats["avg_rating"] or "-", f"피드백 {feedback_stats['count']}건 / 저평가 {int(feedback_stats['low_count'] or 0)}건")
@@ -2123,7 +2145,7 @@ def dashboard(request: Request):
             """
             <tr>
               <td>{code}</td>
-              <td><strong>{title}</strong><div class='muted'>{record_type}</div><div class='muted'>{target}</div></td>
+              <td><strong>{title}</strong><div class='muted'>{record_type}</div><div class='muted'>{target}</div><div class='muted'>{contact}</div></td>
               <td>{priority}<div style='margin-top:6px'>{status}</div></td>
               <td>{owner}</td>
               <td>{due}<div style='margin-top:6px'>{due_badge}</div></td>
@@ -2133,6 +2155,7 @@ def dashboard(request: Request):
                 title=esc(row["title"]),
                 record_type=esc(row["record_type"] or "-"),
                 target=esc(row["target_name"] or row["facility_name"] or "-"),
+                contact=esc(_contact_summary(row, prefix="contact_") or "-"),
                 priority=status_badge(row["priority"]),
                 status=status_badge(row["status"]),
                 owner=esc(row["owner_name"] or "미지정"),
@@ -2149,6 +2172,35 @@ def dashboard(request: Request):
         )
     else:
         office_table = "<section class='panel'><h2>최근 행정업무</h2>" + empty_state("등록된 행정업무가 없습니다.") + "</section>"
+
+    if recent_contacts:
+        contact_rows = "".join(
+            """
+            <tr>
+              <td>{code}</td>
+              <td><strong>{summary}</strong><div class='muted'>{contact_type}</div></td>
+              <td>{meta}</td>
+              <td>{status}</td>
+              <td>{linked}</td>
+            </tr>
+            """.format(
+                code=esc(row["contact_code"]),
+                summary=esc(_contact_summary(row) or row["name"]),
+                contact_type=esc(row["contact_type"] or "-"),
+                meta=esc(_contact_meta(row) or "-"),
+                status=status_badge(row["status"]),
+                linked=esc(f"{int(row['office_record_count'] or 0)}건"),
+            )
+            for row in recent_contacts
+        )
+        contacts_table = (
+            "<section class='panel'><div class='split'><h2>최근 연락처</h2>"
+            "<a class='btn secondary' href='/contacts'>전체 보기</a></div>"
+            "<table><thead><tr><th>코드</th><th>연락처</th><th>연락수단</th><th>상태</th><th>연계</th></tr></thead>"
+            f"<tbody>{contact_rows}</tbody></table></section>"
+        )
+    else:
+        contacts_table = "<section class='panel'><h2>최근 연락처</h2>" + empty_state("등록된 연락처가 없습니다.") + "</section>"
 
     if recent_transactions:
         tx_rows = "".join(
@@ -2189,6 +2241,7 @@ def dashboard(request: Request):
             "9명까지 동시에 쓰는 환경을 기준으로 시설, 재고, 작업지시, 보고서를 한 흐름으로 묶었습니다.",
             actions=(
                 "<a class='btn primary' href='/work-orders'>작업지시 바로가기</a>"
+                "<a class='btn secondary' href='/contacts'>연락처</a>"
                 "<a class='btn secondary' href='/office-records'>행정업무</a>"
                 "<a class='btn secondary' href='/reports'>운영 보고서</a>"
             ),
@@ -2209,6 +2262,7 @@ def dashboard(request: Request):
         + complaint_table
         + work_table
         + office_table
+        + contacts_table
         + tx_table
         + "</div></div>"
     )
@@ -4954,6 +5008,61 @@ def reports_page(request: Request):
         """,
         (start, end),
     ).fetchone()
+    created_office_records = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM office_records
+        WHERE substr(created_at, 1, 10) BETWEEN ? AND ?
+        """,
+        (start, end),
+    ).fetchone()["count"]
+    completed_office_records = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM office_records
+        WHERE completed_at != ''
+          AND substr(completed_at, 1, 10) BETWEEN ? AND ?
+        """,
+        (start, end),
+    ).fetchone()["count"]
+    open_office_records = conn.execute(
+        "SELECT COUNT(*) AS count FROM office_records WHERE status NOT IN ('완료')"
+    ).fetchone()["count"]
+    overdue_office_records = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM office_records
+        WHERE due_date != ''
+          AND due_date < ?
+          AND status NOT IN ('완료')
+        """,
+        (_today_text(),),
+    ).fetchone()["count"]
+    total_contacts = conn.execute("SELECT COUNT(*) AS count FROM contacts").fetchone()["count"]
+    active_contacts = conn.execute(
+        "SELECT COUNT(*) AS count FROM contacts WHERE status = '활성'"
+    ).fetchone()["count"]
+    linked_contacts = conn.execute(
+        "SELECT COUNT(DISTINCT contact_id) AS count FROM office_records WHERE contact_id IS NOT NULL"
+    ).fetchone()["count"]
+    contact_type_rows = conn.execute(
+        """
+        SELECT contact_type, COUNT(*) AS count,
+               SUM(CASE WHEN status = '활성' THEN 1 ELSE 0 END) AS active_count
+        FROM contacts
+        GROUP BY contact_type
+        ORDER BY count DESC, contact_type ASC
+        """
+    ).fetchall()
+    office_record_type_rows = conn.execute(
+        """
+        SELECT record_type, COUNT(*) AS count,
+               SUM(CASE WHEN status NOT IN ('완료') THEN 1 ELSE 0 END) AS open_count
+        FROM office_records
+        GROUP BY record_type
+        ORDER BY count DESC, record_type ASC
+        """
+    ).fetchall()
     low_stock_rows = conn.execute(
         """
         SELECT item_code, name, quantity, min_quantity, unit, location
@@ -4981,6 +5090,20 @@ def reports_page(request: Request):
         LIMIT 10
         """
     ).fetchall()
+    high_priority_office_rows = conn.execute(
+        """
+        SELECT r.record_code, r.title, r.record_type, r.priority, r.status, r.due_date,
+               c.contact_type AS contact_contact_type, c.name AS contact_name, c.organization AS contact_organization,
+               c.department AS contact_department, c.position AS contact_position, c.phone AS contact_phone,
+               c.email AS contact_email, c.status AS contact_status
+        FROM office_records r
+        LEFT JOIN contacts c ON c.id = r.contact_id
+        WHERE r.priority IN ('긴급', '높음')
+          AND r.status NOT IN ('완료')
+        ORDER BY CASE r.priority WHEN '긴급' THEN 1 ELSE 2 END, r.due_date ASC, r.updated_at DESC
+        LIMIT 10
+        """
+    ).fetchall()
     recent_updates = conn.execute(
         """
         SELECT u.created_at, u.update_type, u.body, w.work_code, w.title
@@ -4988,6 +5111,21 @@ def reports_page(request: Request):
         JOIN work_orders w ON w.id = u.work_order_id
         WHERE substr(u.created_at, 1, 10) BETWEEN ? AND ?
         ORDER BY u.created_at DESC, u.id DESC
+        LIMIT 8
+        """,
+        (start, end),
+    ).fetchall()
+    office_updates = conn.execute(
+        """
+        SELECT ou.created_at, ou.update_type, ou.body, r.record_code, r.title,
+               c.contact_type AS contact_contact_type, c.name AS contact_name, c.organization AS contact_organization,
+               c.department AS contact_department, c.position AS contact_position, c.phone AS contact_phone,
+               c.email AS contact_email, c.status AS contact_status
+        FROM office_record_updates ou
+        JOIN office_records r ON r.id = ou.office_record_id
+        LEFT JOIN contacts c ON c.id = r.contact_id
+        WHERE substr(ou.created_at, 1, 10) BETWEEN ? AND ?
+        ORDER BY ou.created_at DESC, ou.id DESC
         LIMIT 8
         """,
         (start, end),
@@ -5050,6 +5188,16 @@ def reports_page(request: Request):
         """,
         (start, end),
     ).fetchall()
+    linked_contact_rows = conn.execute(
+        """
+        SELECT c.contact_code, c.contact_type, c.name, c.organization, c.phone, COUNT(r.id) AS office_record_count
+        FROM contacts c
+        JOIN office_records r ON r.contact_id = c.id
+        GROUP BY c.id
+        ORDER BY office_record_count DESC, c.updated_at DESC, c.id DESC
+        LIMIT 10
+        """
+    ).fetchall()
     tx_count = conn.execute(
         """
         SELECT COUNT(*) AS count
@@ -5072,19 +5220,30 @@ def reports_page(request: Request):
         f"- SLA 오늘 마감: {due_today_complaints}건",
         f"- 반복 민원: {repeat_complaints}건",
         "",
-        "2. 만족도",
+        "2. 행정업무 현황",
+        f"- 신규 등록: {created_office_records}건",
+        f"- 완료 처리: {completed_office_records}건",
+        f"- 현재 미완료: {open_office_records}건",
+        f"- 기한 초과: {overdue_office_records}건",
+        "",
+        "3. 연락처 운영",
+        f"- 전체 연락처: {total_contacts}건",
+        f"- 활성 연락처: {active_contacts}건",
+        f"- 행정업무 연결 연락처: {linked_contacts}건",
+        "",
+        "4. 만족도",
         f"- 만족도 기록: {feedback_stats['count']}건",
         f"- 평균 점수: {feedback_stats['avg_rating'] or '-'}",
         f"- 만족(4점 이상): {int(feedback_stats['satisfied_count'] or 0)}건",
         f"- 불만(2점 이하): {int(feedback_stats['dissatisfied_count'] or 0)}건",
         "",
-        "3. 작업지시 현황",
+        "5. 작업지시 현황",
         f"- 신규 등록: {created_work}건",
         f"- 완료 처리: {completed_work}건",
         f"- 현재 미완료: {open_work}건",
         f"- 지연 작업: {overdue_work}건",
         "",
-        "4. 재고 운영",
+        "6. 재고 운영",
         f"- 기간 중 수불 처리: {tx_count}건",
         f"- 부족 재고 경고: {len(low_stock_rows)}건",
     ]
@@ -5096,7 +5255,7 @@ def reports_page(request: Request):
     else:
         report_lines.append("  · 부족 재고 없음")
 
-    report_lines.extend(["", "5. 우선 조치 대상"])
+    report_lines.extend(["", "7. 우선 조치 대상"])
     if high_priority_rows:
         for row in high_priority_rows[:5]:
             report_lines.append(
@@ -5105,7 +5264,16 @@ def reports_page(request: Request):
     else:
         report_lines.append("  · 긴급/높음 미완료 작업 없음")
 
-    report_lines.extend(["", "6. 민원 지연 현황"])
+    report_lines.extend(["", "8. 행정업무 우선 대응"])
+    if high_priority_office_rows:
+        for row in high_priority_office_rows[:5]:
+            report_lines.append(
+                f"  · {row['record_code']} {row['title']} / {row['priority']} / {row['status']} / 기한 {fmt_date(row['due_date'])} / 연락처 {_contact_summary(row, prefix='contact_') or '-'}"
+            )
+    else:
+        report_lines.append("  · 긴급/높음 미완료 행정업무 없음")
+
+    report_lines.extend(["", "9. 민원 지연 현황"])
     if overdue_complaint_rows:
         for row in overdue_complaint_rows[:5]:
             report_lines.append(
@@ -5114,7 +5282,7 @@ def reports_page(request: Request):
     else:
         report_lines.append("  · 지연 민원 없음")
 
-    report_lines.extend(["", "7. 시설 상태"])
+    report_lines.extend(["", "10. 시설 상태"])
     if facility_status_rows:
         for row in facility_status_rows:
             report_lines.append(f"  · {row['status']}: {row['count']}개")
@@ -5126,6 +5294,9 @@ def reports_page(request: Request):
         + metric_card("신규 민원", created_complaints, f"종결 {closed_complaints}건")
         + metric_card("진행 민원", open_complaints, f"회신 지연 {overdue_complaints}건 / 오늘 마감 {due_today_complaints}건")
         + metric_card("반복 민원", repeat_complaints, f"최근 {COMPLAINT_REPEAT_WINDOW_DAYS}일 기준")
+        + metric_card("신규 행정업무", created_office_records, f"완료 {completed_office_records}건")
+        + metric_card("행정업무 지연", overdue_office_records, f"현재 미완료 {open_office_records}건")
+        + metric_card("연락처", total_contacts, f"활성 {active_contacts}건 / 연계 {linked_contacts}건")
         + metric_card("만족도 평균", feedback_stats["avg_rating"] or "-", f"피드백 {feedback_stats['count']}건")
         + metric_card("신규 작업", created_work, f"{start}~{end}")
         + metric_card("완료 작업", completed_work, f"현재 미완료 {open_work}건")
@@ -5216,6 +5387,35 @@ def reports_page(request: Request):
         + "</tbody></table>"
     )
 
+    high_priority_office_html = (
+        "<table><thead><tr><th>번호</th><th>행정업무</th><th>우선도</th><th>상태</th><th>기한</th></tr></thead><tbody>"
+        + (
+            "".join(
+                """
+                <tr>
+                  <td>{code}</td>
+                  <td><strong>{title}</strong><div class='muted'>{record_type}</div><div class='muted'>{contact}</div></td>
+                  <td>{priority}</td>
+                  <td>{status}</td>
+                  <td>{due}</td>
+                </tr>
+                """.format(
+                    code=esc(row["record_code"]),
+                    title=esc(row["title"]),
+                    record_type=esc(row["record_type"] or "-"),
+                    contact=esc(_contact_summary(row, prefix="contact_") or "-"),
+                    priority=status_badge(row["priority"]),
+                    status=status_badge(row["status"]),
+                    due=esc(fmt_date(row["due_date"])),
+                )
+                for row in high_priority_office_rows
+            )
+            if high_priority_office_rows
+            else "<tr><td colspan='5' class='muted'>우선 대응 행정업무가 없습니다.</td></tr>"
+        )
+        + "</tbody></table>"
+    )
+
     updates_html = (
         "<table><thead><tr><th>시각</th><th>작업</th><th>유형</th><th>내용</th></tr></thead><tbody>"
         + (
@@ -5238,6 +5438,33 @@ def reports_page(request: Request):
             )
             if recent_updates
             else "<tr><td colspan='4' class='muted'>기간 내 업데이트가 없습니다.</td></tr>"
+        )
+        + "</tbody></table>"
+    )
+
+    office_updates_html = (
+        "<table><thead><tr><th>시각</th><th>행정업무</th><th>유형</th><th>내용</th></tr></thead><tbody>"
+        + (
+            "".join(
+                """
+                <tr>
+                  <td>{when}</td>
+                  <td><strong>{code}</strong><div class='muted'>{title}</div><div class='muted'>{contact}</div></td>
+                  <td>{type}</td>
+                  <td>{body}</td>
+                </tr>
+                """.format(
+                    when=esc(fmt_datetime(row["created_at"])),
+                    code=esc(row["record_code"]),
+                    title=esc(row["title"]),
+                    contact=esc(_contact_summary(row, prefix="contact_") or "-"),
+                    type=status_badge(row["update_type"]),
+                    body=esc(row["body"]),
+                )
+                for row in office_updates
+            )
+            if office_updates
+            else "<tr><td colspan='4' class='muted'>기간 내 행정업무 업데이트가 없습니다.</td></tr>"
         )
         + "</tbody></table>"
     )
@@ -5299,6 +5526,78 @@ def reports_page(request: Request):
         + "</tbody></table>"
     )
 
+    contact_type_html = (
+        "<table><thead><tr><th>구분</th><th>전체</th><th>활성</th></tr></thead><tbody>"
+        + (
+            "".join(
+                """
+                <tr>
+                  <td>{contact_type}</td>
+                  <td>{count}</td>
+                  <td>{active_count}</td>
+                </tr>
+                """.format(
+                    contact_type=esc(row["contact_type"] or "-"),
+                    count=esc(row["count"]),
+                    active_count=esc(row["active_count"]),
+                )
+                for row in contact_type_rows
+            )
+            if contact_type_rows
+            else "<tr><td colspan='3' class='muted'>연락처 데이터가 없습니다.</td></tr>"
+        )
+        + "</tbody></table>"
+    )
+
+    office_type_html = (
+        "<table><thead><tr><th>구분</th><th>전체</th><th>미완료</th></tr></thead><tbody>"
+        + (
+            "".join(
+                """
+                <tr>
+                  <td>{record_type}</td>
+                  <td>{count}</td>
+                  <td>{open_count}</td>
+                </tr>
+                """.format(
+                    record_type=esc(row["record_type"] or "-"),
+                    count=esc(row["count"]),
+                    open_count=esc(row["open_count"]),
+                )
+                for row in office_record_type_rows
+            )
+            if office_record_type_rows
+            else "<tr><td colspan='3' class='muted'>행정업무 데이터가 없습니다.</td></tr>"
+        )
+        + "</tbody></table>"
+    )
+
+    linked_contacts_html = (
+        "<table><thead><tr><th>코드</th><th>연락처</th><th>연락수단</th><th>연계 건수</th></tr></thead><tbody>"
+        + (
+            "".join(
+                """
+                <tr>
+                  <td>{code}</td>
+                  <td><strong>{summary}</strong><div class='muted'>{contact_type}</div></td>
+                  <td>{phone}</td>
+                  <td>{linked}</td>
+                </tr>
+                """.format(
+                    code=esc(row["contact_code"]),
+                    summary=esc(" / ".join(part for part in [row["organization"], row["name"]] if str(part or "").strip()) or row["name"]),
+                    contact_type=esc(row["contact_type"] or "-"),
+                    phone=esc(row["phone"] or "-"),
+                    linked=esc(row["office_record_count"]),
+                )
+                for row in linked_contact_rows
+            )
+            if linked_contact_rows
+            else "<tr><td colspan='4' class='muted'>연계 연락처가 없습니다.</td></tr>"
+        )
+        + "</tbody></table>"
+    )
+
     feedback_html = (
         "<table><thead><tr><th>번호</th><th>민원</th><th>만족도</th><th>후속 연락일</th><th>코멘트</th></tr></thead><tbody>"
         + (
@@ -5352,6 +5651,12 @@ def reports_page(request: Request):
         + "<section class='panel'><h2>반복 민원</h2>"
         + repeat_complaints_html
         + "</section>"
+        + "<section class='panel'><h2>행정업무 우선 대응</h2>"
+        + high_priority_office_html
+        + "</section>"
+        + "<section class='panel'><h2>행정업무 구분 현황</h2>"
+        + office_type_html
+        + "</section>"
         + "<section class='panel'><h2>부족 재고</h2>"
         + low_stock_html
         + "</section></div>"
@@ -5359,8 +5664,17 @@ def reports_page(request: Request):
         + "<section class='panel'><h2>우선 조치 대상</h2>"
         + high_priority_html
         + "</section>"
+        + "<section class='panel'><h2>연락처 분류 현황</h2>"
+        + contact_type_html
+        + "</section>"
+        + "<section class='panel'><h2>연계 연락처</h2>"
+        + linked_contacts_html
+        + "</section>"
         + "<section class='panel'><h2>만족도 기록</h2>"
         + feedback_html
+        + "</section>"
+        + "<section class='panel'><h2>기간 내 행정업무 업데이트</h2>"
+        + office_updates_html
         + "</section>"
         + "<section class='panel'><h2>기간 내 민원 업데이트</h2>"
         + complaint_updates_html

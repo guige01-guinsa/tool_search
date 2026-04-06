@@ -84,6 +84,10 @@ def main() -> None:
         expect(office_records.status_code == 200, "행정업무 화면 접근에 실패했습니다.")
         expect("기안지, 공문서, 정기점검" in office_records.text and "연결 연락처" in office_records.text, "행정업무 화면 설명이 비정상입니다.")
 
+        reports = client.get("/reports")
+        expect(reports.status_code == 200, "보고서 화면 접근에 실패했습니다.")
+        expect("연락처 분류 현황" in reports.text and "기간 내 행정업무 업데이트" in reports.text, "보고서의 연락처/행정업무 섹션이 비정상입니다.")
+
         complaints_pdf = client.get("/complaints/pdf")
         expect(
             complaints_pdf.status_code == 200
