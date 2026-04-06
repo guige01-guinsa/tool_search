@@ -17,6 +17,18 @@ def expect(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+SAMPLE_PNG = (
+    b"\x89PNG\r\n\x1a\n"
+    b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
+    b"\x00\x00\x00\x0cIDATx\x9cc\xf8\xff\xff?\x00\x05\xfe\x02\xfeA\xd9\x8f\x9b"
+    b"\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+
+def image_files(prefix: str, count: int) -> list[tuple[str, tuple[str, bytes, str]]]:
+    return [("files", (f"{prefix}-{idx}.png", SAMPLE_PNG, "image/png")) for idx in range(count)]
+
+
 def main() -> None:
     tmp_path = ROOT_DIR / f"tmp_ops_crud_check_{uuid.uuid4().hex[:8]}"
     if tmp_path.exists():
@@ -64,12 +76,18 @@ def main() -> None:
                 "manager_user_id": "",
                 "note": "CRUD 검증",
             },
+            files=image_files(f"facility-{suffix}", 6),
             follow_redirects=False,
         )
         expect(facility_create.status_code in {302, 303}, "시설 등록 요청이 실패했습니다.")
         facility_row = fetchone("SELECT * FROM facilities WHERE name = ?", (facility_name,))
         expect(facility_row is not None, "시설이 생성되지 않았습니다.")
         facility_id = facility_row["id"]
+        facility_attachment_count = fetchone(
+            "SELECT COUNT(*) AS count FROM attachments WHERE entity_type = 'facility' AND entity_id = ?",
+            (facility_id,),
+        )["count"]
+        expect(facility_attachment_count == 6, "시설 첨부 이미지 저장 개수가 올바르지 않습니다.")
 
         facility_page = client.get(f"/facilities?edit={facility_id}")
         expect(facility_page.status_code == 200 and "formaction='/facilities/delete/" in facility_page.text, "시설 수정 화면의 삭제 버튼 구조가 올바르지 않습니다.")
@@ -92,6 +110,31 @@ def main() -> None:
         expect(facility_update.status_code in {302, 303}, "시설 수정 요청이 실패했습니다.")
         facility_row = fetchone("SELECT * FROM facilities WHERE id = ?", (facility_id,))
         expect(facility_row["name"].endswith("-수정"), "시설 수정이 반영되지 않았습니다.")
+
+        facility_over_limit = client.post(
+            "/facilities/save",
+            data={
+                "facility_id": str(facility_id),
+                "category": "기계",
+                "name": f"{facility_name}-초과시도",
+                "building": "별관",
+                "floor": "1F",
+                "zone": "기계실",
+                "status": "점검중",
+                "manager_user_id": "",
+                "note": "첨부 초과 시도",
+            },
+            files=image_files(f"facility-over-{suffix}", 1),
+            follow_redirects=False,
+        )
+        expect(facility_over_limit.status_code in {302, 303}, "시설 첨부 초과 제한 응답이 비정상입니다.")
+        facility_row = fetchone("SELECT * FROM facilities WHERE id = ?", (facility_id,))
+        expect(facility_row["name"].endswith("-수정"), "시설 첨부 초과 시 기본정보가 변경되면 안 됩니다.")
+        facility_attachment_count = fetchone(
+            "SELECT COUNT(*) AS count FROM attachments WHERE entity_type = 'facility' AND entity_id = ?",
+            (facility_id,),
+        )["count"]
+        expect(facility_attachment_count == 6, "시설 첨부 초과 시 이미지가 추가 저장되면 안 됩니다.")
 
         contact_name = f"검증연락처-{suffix}"
         contact_create = client.post(
@@ -336,12 +379,18 @@ def main() -> None:
                 "purchase_amount": "10000",
                 "note": "CRUD 검증",
             },
+            files=image_files(f"inventory-{suffix}", 6),
             follow_redirects=False,
         )
         expect(inventory_create.status_code in {302, 303}, "재고 등록 요청이 실패했습니다.")
         inventory_row = fetchone("SELECT * FROM inventory_items WHERE name = ?", (inventory_name,))
         expect(inventory_row is not None, "재고가 생성되지 않았습니다.")
         inventory_id = inventory_row["id"]
+        inventory_attachment_count = fetchone(
+            "SELECT COUNT(*) AS count FROM attachments WHERE entity_type = 'inventory' AND entity_id = ?",
+            (inventory_id,),
+        )["count"]
+        expect(inventory_attachment_count == 6, "재고 첨부 이미지 저장 개수가 올바르지 않습니다.")
 
         inventory_page = client.get(f"/inventory?edit={inventory_id}")
         expect(inventory_page.status_code == 200 and "formaction='/inventory/delete/" in inventory_page.text, "재고 수정 화면의 삭제 버튼 구조가 올바르지 않습니다.")
@@ -367,6 +416,34 @@ def main() -> None:
         expect(inventory_update.status_code in {302, 303}, "재고 수정 요청이 실패했습니다.")
         inventory_row = fetchone("SELECT * FROM inventory_items WHERE id = ?", (inventory_id,))
         expect(inventory_row["name"].endswith("-수정") and inventory_row["quantity"] == 8, "재고 수정이 반영되지 않았습니다.")
+
+        inventory_over_limit = client.post(
+            "/inventory/save",
+            data={
+                "item_id": str(inventory_id),
+                "category": "기계",
+                "name": f"{inventory_name}-초과시도",
+                "specification": "20A",
+                "quantity": "8",
+                "unit": "개",
+                "location": "창고 B",
+                "status": "정상",
+                "min_quantity": "3",
+                "purchase_date": "2026-03-30",
+                "purchase_amount": "12000",
+                "note": "첨부 초과 시도",
+            },
+            files=image_files(f"inventory-over-{suffix}", 1),
+            follow_redirects=False,
+        )
+        expect(inventory_over_limit.status_code in {302, 303}, "재고 첨부 초과 제한 응답이 비정상입니다.")
+        inventory_row = fetchone("SELECT * FROM inventory_items WHERE id = ?", (inventory_id,))
+        expect(inventory_row["name"].endswith("-수정"), "재고 첨부 초과 시 기본정보가 변경되면 안 됩니다.")
+        inventory_attachment_count = fetchone(
+            "SELECT COUNT(*) AS count FROM attachments WHERE entity_type = 'inventory' AND entity_id = ?",
+            (inventory_id,),
+        )["count"]
+        expect(inventory_attachment_count == 6, "재고 첨부 초과 시 이미지가 추가 저장되면 안 됩니다.")
 
         inventory_tx = client.post(
             f"/inventory/tx/{inventory_id}",

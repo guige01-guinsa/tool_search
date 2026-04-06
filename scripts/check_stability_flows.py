@@ -76,6 +76,14 @@ def main() -> None:
         expect("행정업무" in dashboard.text, "대시보드에 행정업무 진입점이 없습니다.")
         expect("연락처" in dashboard.text, "대시보드에 연락처 진입점이 없습니다.")
 
+        facilities = client.get("/facilities")
+        expect(facilities.status_code == 200, "시설 화면 접근에 실패했습니다.")
+        expect("첨부 이미지 (최대 6장)" in facilities.text, "시설 화면의 첨부 이미지 제한 안내가 없습니다.")
+
+        inventory = client.get("/inventory")
+        expect(inventory.status_code == 200, "재고 화면 접근에 실패했습니다.")
+        expect("첨부 이미지 (최대 6장)" in inventory.text, "재고 화면의 첨부 이미지 제한 안내가 없습니다.")
+
         contacts = client.get("/contacts")
         expect(contacts.status_code == 200, "연락처 화면 접근에 실패했습니다.")
         expect("업체연락처, 근무자연락처, 계약업체, 관공서" in contacts.text, "연락처 화면 설명이 비정상입니다.")
